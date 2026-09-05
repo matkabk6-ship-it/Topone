@@ -116,8 +116,11 @@ def _create_admin_token(admin_id: str, email: str) -> str:
 
 
 # -- Domain constants ----------------------------------------------------------
-PLANS: dict[str, dict[str, Any]] = {
-    "base": {
+# Default plan config — seeded once into the `plans` collection so the admin
+# can edit price / duration / benefits from the UI. The keys "base" and "pro"
+# are stable identifiers; the admin edits everything else.
+DEFAULT_PLANS: list[dict[str, Any]] = [
+    {
         "id": "base",
         "name": "Base Plan",
         "price": 299,
@@ -125,8 +128,10 @@ PLANS: dict[str, dict[str, Any]] = {
         "benefits": {"open": 3, "jodi": 6, "pane": 0},
         "duration_days": 30,
         "tagline": "3 Open, 6 Jodi",
+        "active": True,
+        "sort_order": 1,
     },
-    "pro": {
+    {
         "id": "pro",
         "name": "Pro Plan",
         "price": 599,
@@ -134,8 +139,32 @@ PLANS: dict[str, dict[str, Any]] = {
         "benefits": {"open": 1, "jodi": 2, "pane": 2},
         "duration_days": 30,
         "tagline": "1 Open, 2 Jodi, 2 Pane",
+        "active": True,
+        "sort_order": 2,
     },
-}
+]
+
+
+async def _get_plan(plan_id: str) -> Optional[dict[str, Any]]:
+    return await db.plans.find_one({"id": plan_id}, {"_id": 0})
+
+
+def sanitize_plan(p: dict[str, Any]) -> dict[str, Any]:
+    benefits = dict(p.get("benefits", {}))
+    for k in ("open", "jodi", "pane"):
+        benefits.setdefault(k, 0)
+    return {
+        "id": p["id"],
+        "name": p.get("name", p["id"].title() + " Plan"),
+        "price": p.get("price", 0),
+        "currency": p.get("currency", "INR"),
+        "benefits": benefits,
+        "duration_days": p.get("duration_days", 30),
+        "tagline": p.get("tagline", ""),
+        "active": p.get("active", True),
+        "sort_order": p.get("sort_order", 99),
+    }
+
 
 DEFAULT_GAMES: list[dict[str, Any]] = [
     {"id": "sridevi", "name": "SRIDEVI",
@@ -231,12 +260,40 @@ class CreateNotificationIn(BaseModel):
 
 
 class UpdateGameIn(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    open_time: Optional[str] = None
-    close_time: Optional[str] = None
-    schedule_note: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=64)
+    description: Optional[str] = Field(default=None, max_length=500)
+    open_time: Optional[str] = Field(default=None, max_length=8)
+    close_time: Optional[str] = Field(default=None, max_length=8)
+    schedule_note: Optional[str] = Field(default=None, max_length=64)
     status: Optional[str] = Field(default=None, pattern="^(active|inactive)$")
+    sort_order: Optional[int] = Field(default=None, ge=0, le=999)
+
+
+class CreateGameIn(BaseModel):
+    id: str = Field(min_length=2, max_length=32, pattern="^[a-z0-9_]+$")
+    name: str = Field(min_length=2, max_length=64)
+    description: str = Field(default="", max_length=500)
+    open_time: Optional[str] = Field(default=None, max_length=8)
+    close_time: Optional[str] = Field(default=None, max_length=8)
+    schedule_note: str = Field(default="", max_length=64)
+    status: str = Field(default="active", pattern="^(active|inactive)$")
+    sort_order: int = Field(default=50, ge=0, le=999)
+
+
+class BenefitsIn(BaseModel):
+    open: int = Field(default=0, ge=0, le=999)
+    jodi: int = Field(default=0, ge=0, le=999)
+    pane: int = Field(default=0, ge=0, le=999)
+
+
+class UpdatePlanIn(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=64)
+    price: Optional[int] = Field(default=None, ge=0, le=1_000_000)
+    duration_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    benefits: Optional[BenefitsIn] = None
+    tagline: Optional[str] = Field(default=None, max_length=140)
+    active: Optional[bool] = None
+    sort_order: Optional[int] = Field(default=None, ge=0, le=999)
 
 
 class PaymentConfigIn(BaseModel):
@@ -448,6 +505,15 @@ async def seed_data() -> None:
             {"$setOnInsert": {**g, "created_at": _now()}},
             upsert=True,
         )
+
+    # Seed plans (idempotent — existing edits stay)
+    for p in DEFAULT_PLANS:
+        await db.plans.update_one(
+            {"id": p["id"]},
+            {"$setOnInsert": {**p, "created_at": _now()}},
+            upsert=True,
+        )
+    await db.plans.create_index("id", unique=True)
 
     # Seed payment settings
     await db.settings.update_one(
