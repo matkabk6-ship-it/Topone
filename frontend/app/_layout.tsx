@@ -33,6 +33,7 @@ export default function RootLayout() {
                 <Stack.Screen name="subscription" options={{ presentation: "card" }} />
                 <Stack.Screen name="payment/[planId]" options={{ presentation: "card" }} />
                 <Stack.Screen name="payments/history" />
+                <Stack.Screen name="tips" />
                 <Stack.Screen name="game/[id]" />
                 <Stack.Screen name="settings" />
                 <Stack.Screen name="legal/[doc]" />

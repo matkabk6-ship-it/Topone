@@ -236,6 +236,18 @@ export type Announcement = {
   created_at: string | null;
 };
 
+export type Tip = {
+  id: string;
+  game_id: string;
+  tip_type: "open" | "jodi" | "pane";
+  value: string;
+  session: "open" | "close" | null;
+  note: string | null;
+  audience: "base" | "pro" | "both";
+  for_date: string | null;
+  created_at: string | null;
+};
+
 export type AdminInfo = {
   id: string;
   email: string;
@@ -290,6 +302,8 @@ export const api = {
 
   announcements: () => request<Announcement[]>("/announcements", {}, { auth: "none" }),
 
+  tips: () => request<{ tips: Tip[]; plan: "base" | "pro" | null }>("/tips"),
+
   createTicket: (body: { subject: string; message: string; category?: string }) =>
     request<{ id: string; status: string }>("/support/ticket", {
       method: "POST",
@@ -339,6 +353,20 @@ export const adminApi = {
     request<Announcement>("/admin/announcements", { method: "POST", body: JSON.stringify(body) }, { auth: "admin" }),
   deleteAnnouncement: (id: string) =>
     request<{ ok: boolean }>(`/admin/announcements/${id}`, { method: "DELETE" }, { auth: "admin" }),
+  listTips: (audience?: "base" | "pro" | "both") =>
+    request<Tip[]>(`/admin/tips${audience ? `?audience=${audience}` : ""}`, {}, { auth: "admin" }),
+  createTip: (body: {
+    game_id: string;
+    tip_type: "open" | "jodi" | "pane";
+    value: string;
+    session?: "open" | "close";
+    note?: string;
+    audience: "base" | "pro" | "both";
+    for_date?: string;
+  }) =>
+    request<Tip>("/admin/tips", { method: "POST", body: JSON.stringify(body) }, { auth: "admin" }),
+  deleteTip: (id: string) =>
+    request<{ ok: boolean }>(`/admin/tips/${id}`, { method: "DELETE" }, { auth: "admin" }),
   getPaymentSettings: () => request<any>("/admin/settings/payment", {}, { auth: "admin" }),
   updatePaymentSettings: (body: any) =>
     request<any>("/admin/settings/payment", { method: "PATCH", body: JSON.stringify(body) }, { auth: "admin" }),

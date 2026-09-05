@@ -29,12 +29,12 @@ const CARD_TEXTURE =
 type IconName = React.ComponentProps<typeof Feather>["name"];
 
 const QUICK_ACTIONS: { id: string; label: string; icon: IconName; href: string }[] = [
+  { id: "tips", label: "My Tips", icon: "star", href: "/tips" },
   { id: "games", label: "Games", icon: "grid", href: "/(tabs)/games" },
   { id: "results", label: "Results", icon: "trending-up", href: "/(tabs)/results" },
-  { id: "subscribe", label: "Subscribe", icon: "star", href: "/subscription" },
+  { id: "subscribe", label: "Subscribe", icon: "award", href: "/subscription" },
   { id: "history", label: "Payments", icon: "credit-card", href: "/payments/history" },
   { id: "help", label: "Help", icon: "help-circle", href: "/help" },
-  { id: "settings", label: "Settings", icon: "settings", href: "/settings" },
 ];
 
 export default function HomeScreen() {
@@ -176,6 +176,14 @@ export default function HomeScreen() {
                 <BenefitPill label="Pane" left={sub.benefits_remaining.pane} total={sub.benefits_total.pane} />
               ) : null}
             </View>
+            <View style={{ height: 12 }} />
+            <Pressable
+              onPress={() => router.push("/tips")}
+              style={styles.primarySmall}
+              testID="home-open-tips"
+            >
+              <Text style={styles.primarySmallText}>Open my tips</Text>
+            </Pressable>
           </Card>
         ) : (
           <Card testID="home-sub-empty">

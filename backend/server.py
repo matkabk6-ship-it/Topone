@@ -249,6 +249,16 @@ class UseBenefitIn(BaseModel):
     benefit_type: str = Field(pattern="^(open|jodi|pane)$")
 
 
+class CreateTipIn(BaseModel):
+    game_id: str
+    tip_type: str = Field(pattern="^(open|jodi|pane)$")
+    value: str = Field(min_length=1, max_length=12)
+    session: Optional[str] = Field(default=None, pattern="^(open|close)$")
+    note: Optional[str] = Field(default=None, max_length=280)
+    audience: str = Field(pattern="^(base|pro|both)$")
+    for_date: Optional[str] = Field(default=None, max_length=10)  # YYYY-MM-DD
+
+
 class SupportTicketIn(BaseModel):
     subject: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
@@ -372,6 +382,20 @@ def sanitize_audit(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def sanitize_tip(t: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": t["id"],
+        "game_id": t["game_id"],
+        "tip_type": t["tip_type"],  # open | jodi | pane
+        "value": t["value"],
+        "session": t.get("session"),
+        "note": t.get("note"),
+        "audience": t.get("audience", "both"),  # base | pro | both
+        "for_date": t.get("for_date"),
+        "created_at": _iso(t.get("created_at")),
+    }
+
+
 # -- Startup / seed ------------------------------------------------------------
 async def seed_data() -> None:
     # Indexes
@@ -393,6 +417,9 @@ async def seed_data() -> None:
     await db.announcements.create_index("id", unique=True)
     await db.audit_logs.create_index("id", unique=True)
     await db.audit_logs.create_index("created_at")
+    await db.tips.create_index("id", unique=True)
+    await db.tips.create_index([("created_at", -1)])
+    await db.tips.create_index([("audience", 1), ("created_at", -1)])
     await db.settings.create_index("key", unique=True)
     await db.support_tickets.create_index("id", unique=True)
 
@@ -834,6 +861,25 @@ async def announcements():
     return [sanitize_announcement(a) async for a in cursor]
 
 
+# ---------------------------- TIPS (subscribers only) ------------------------
+@api.get("/tips")
+async def my_tips(user=Depends(require_user), limit: int = 50):
+    """Private tips for the current subscriber. Base users see tips whose
+    audience is 'base' or 'both'; Pro users see 'pro' or 'both'. Users
+    without an active subscription get an empty list."""
+    sub = await _get_active_sub(user["user_id"])
+    if not sub:
+        return {"tips": [], "plan": None}
+    plan = sub["plan_id"]  # "base" | "pro"
+    audiences = [plan, "both"]
+    limit = max(1, min(limit, 100))
+    cursor = db.tips.find(
+        {"audience": {"$in": audiences}},
+        {"_id": 0},
+    ).sort("created_at", -1).limit(limit)
+    return {"tips": [sanitize_tip(t) async for t in cursor], "plan": plan}
+
+
 # ---------------------------- SUPPORT -----------------------------------------
 @api.post("/support/ticket")
 async def create_ticket(body: SupportTicketIn, user=Depends(require_user)):
@@ -1120,6 +1166,86 @@ async def admin_create_announcement(body: CreateAnnouncementIn, admin=Depends(re
 async def admin_delete_announcement(aid: str, admin=Depends(require_admin)):
     await db.announcements.update_one({"id": aid}, {"$set": {"active": False}})
     await _audit(f"admin:{admin['admin_id']}", "announcement.deactivate", target=aid)
+    return {"ok": True}
+
+
+# ---- Tips (targeted to subscribers)
+@admin_router.get("/tips")
+async def admin_list_tips(audience: Optional[str] = None, limit: int = 100):
+    q: dict[str, Any] = {}
+    if audience in ("base", "pro", "both"):
+        q["audience"] = audience
+    cursor = db.tips.find(q, {"_id": 0}).sort("created_at", -1).limit(max(1, min(limit, 300)))
+    return [sanitize_tip(t) async for t in cursor]
+
+
+@admin_router.post("/tips")
+async def admin_create_tip(body: CreateTipIn, admin=Depends(require_admin)):
+    # Validate game exists
+    g = await db.games.find_one({"id": body.game_id})
+    if not g:
+        raise HTTPException(404, "Game not found")
+    # Pane tips are Pro-only content: disallow sending pane to base-only audience.
+    if body.tip_type == "pane" and body.audience == "base":
+        raise HTTPException(400, "Pane tips are Pro-only content. Set audience to 'pro' or 'both'.")
+
+    tip = {
+        "id": str(uuid.uuid4()),
+        "game_id": body.game_id,
+        "tip_type": body.tip_type,
+        "value": body.value.strip(),
+        "session": body.session,
+        "note": body.note,
+        "audience": body.audience,
+        "for_date": body.for_date,
+        "created_at": _now(),
+        "created_by": admin["admin_id"],
+    }
+    await db.tips.insert_one(dict(tip))
+
+    # Fan out an in-app notification to every subscriber whose plan matches
+    # this tip's audience.
+    plans_to_target: list[str] = []
+    if body.audience == "both":
+        plans_to_target = ["base", "pro"]
+    else:
+        plans_to_target = [body.audience]
+
+    active_subs = db.subscriptions.find(
+        {"status": "active", "plan_id": {"$in": plans_to_target}},
+        {"user_id": 1, "plan_name": 1, "_id": 0},
+    )
+    now = _now()
+    notif_batch = []
+    async for s in active_subs:
+        notif_batch.append({
+            "id": str(uuid.uuid4()),
+            "user_id": s["user_id"],
+            "type": "tip_new",
+            "title": f"New {g['name']} tip for {s.get('plan_name', 'your plan')}",
+            "message": f"A fresh {body.tip_type.upper()} tip is waiting in your Tips channel.",
+            "read": False,
+            "created_at": now,
+        })
+    if notif_batch:
+        await db.notifications.insert_many(notif_batch)
+
+    await _audit(
+        f"admin:{admin['admin_id']}",
+        "tip.publish",
+        target=tip["id"],
+        metadata={"game_id": body.game_id, "type": body.tip_type, "audience": body.audience,
+                  "reach": len(notif_batch)},
+    )
+    return sanitize_tip(tip)
+
+
+@admin_router.delete("/tips/{tip_id}")
+async def admin_delete_tip(tip_id: str, admin=Depends(require_admin)):
+    res = await db.tips.delete_one({"id": tip_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Tip not found")
+    await _audit(f"admin:{admin['admin_id']}", "tip.delete", target=tip_id)
     return {"ok": True}
 
 

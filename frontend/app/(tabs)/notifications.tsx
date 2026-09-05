@@ -10,6 +10,7 @@ import { makeStyles, useTheme } from "@/src/theme";
 
 const TYPE_ICON: Record<string, React.ComponentProps<typeof Feather>["name"]> = {
   result_new: "trending-up",
+  tip_new: "star",
   payment_submitted: "clock",
   payment_verified: "check-circle",
   payment_rejected: "x-circle",
