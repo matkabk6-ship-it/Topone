@@ -1,0 +1,226 @@
+{
+  "app_name": "TOP ONE",
+  "personality": "6 Glass / Luxe DARK",
+  "personality_one_liner": "A high-end, members-only private club offering exclusive access through rich, cinematic, and deep prestige visuals.",
+  "color": {
+    "light": {
+      "surface": "#FCFAF8",
+      "onSurface": "#1A1A1A",
+      "surfaceSecondary": "#F5F2ED",
+      "onSurfaceSecondary": "#262626",
+      "surfaceTertiary": "#EBE5D9",
+      "onSurfaceTertiary": "#262626",
+      "surfaceInverse": "#121212",
+      "onSurfaceInverse": "#F5F2ED",
+      "brand": "#B8860B",
+      "onBrand": "#FFFFFF",
+      "brandPrimary": "#B8860B",
+      "onBrandPrimary": "#FFFFFF",
+      "brandSecondary": "#D4AF37",
+      "onBrandSecondary": "#1A1A1A",
+      "brandTertiary": "#F0E6D2",
+      "onBrandTertiary": "#B8860B",
+      "muted": "#737373",
+      "border": "#E6E1D6",
+      "borderStrong": "#D1C7B3",
+      "divider": "#E6E1D6",
+      "success": "#15803D",
+      "onSuccess": "#FFFFFF",
+      "warning": "#CA8A04",
+      "onWarning": "#FFFFFF",
+      "error": "#B91C1C",
+      "onError": "#FFFFFF",
+      "info": "#4B5563",
+      "onInfo": "#FFFFFF"
+    },
+    "dark": {
+      "surface": "#09090B",
+      "onSurface": "#F5F2ED",
+      "surfaceSecondary": "#18181B",
+      "onSurfaceSecondary": "#E5E5E5",
+      "surfaceTertiary": "#27272A",
+      "onSurfaceTertiary": "#E5E5E5",
+      "surfaceInverse": "#F5F2ED",
+      "onSurfaceInverse": "#09090B",
+      "brand": "#D4AF37",
+      "onBrand": "#09090B",
+      "brandPrimary": "#D4AF37",
+      "onBrandPrimary": "#09090B",
+      "brandSecondary": "#B8860B",
+      "onBrandSecondary": "#FFFFFF",
+      "brandTertiary": "#2A2415",
+      "onBrandTertiary": "#D4AF37",
+      "muted": "#A3A3A3",
+      "border": "#27272A",
+      "borderStrong": "#3F3F46",
+      "divider": "#27272A",
+      "success": "#16A34A",
+      "onSuccess": "#FFFFFF",
+      "warning": "#EAB308",
+      "onWarning": "#09090B",
+      "error": "#EF4444",
+      "onError": "#FFFFFF",
+      "info": "#9CA3AF",
+      "onInfo": "#09090B"
+    }
+  },
+  "typography": {
+    "displayFontFamily": "CormorantGaramond_500Medium",
+    "textFontFamily": "Satoshi",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous editorial spacing. Elements should breathe, mimicking the luxurious negative space of print magazines.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": 0,
+  "navigation": "bottom_tabs",
+  "icon_set": "Feather",
+  "glassmorphism": {
+    "enabled": true,
+    "do's": [
+      "Use heavy blur (expo-blur) with translucent tint for tab bars and floating headers",
+      "Add glassmorphism to the digital membership User ID card, placing it over the abstract gold texture to create a 3D hologram card effect",
+      "Apply glass effects on floating action buttons and bottom-sheet handles"
+    ],
+    "dont's": [
+      "Never blur body content or list rows.",
+      "Never use pure transparent blurs without an underlying tint base (min 70% opacity) to guarantee readability"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-blur",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler",
+    "qr_code": "react-native-qrcode-svg"
+  },
+  "screens": [
+    {
+      "name": "Onboarding & Splash",
+      "purpose": "A cinematic welcome sequence that auto-generates the 'TOP-XXXXXXXX' User ID with an elegant reveal.",
+      "states": {
+        "loading": "Dark pulsing background with a single elegant spinner",
+        "empty": "N/A",
+        "error": "N/A"
+      },
+      "layout": "Full-bleed background image overlaid with a 3-stop vertical gradient scrim (to surface inverse). The generated User ID sits at the center in display serif, with a bottom-anchored CTA 'Enter the Club'."
+    },
+    {
+      "name": "Home",
+      "purpose": "The main dashboard acting as the club concierge, giving immediate access to the membership ID, current subscription usage, and live games.",
+      "states": {
+        "loading": "Skeleton of the Membership card and content grid",
+        "empty": "N/A",
+        "error": "Centered glass pane with retry action"
+      },
+      "layout": "Use a vertical scrolling feed. The hero is the User ID Card (styled like a digital wallet pass) placed over an abstract texture with glassmorphism. Below that, chronologically stack the active subscription progress card, a 2x2 grid of quick actions in tinted icon containers (brandTertiary), a horizontally scrolling list of live games (Sridevi, Kalyan, Main Bazar), and an announcements banner."
+    },
+    {
+      "name": "Games",
+      "purpose": "A prestige view of the three available games, showing their schedules and latest results.",
+      "states": {
+        "loading": "Stacked skeleton cards",
+        "empty": "Centered gold icon, 'No active games today', primary CTA",
+        "error": "Error banner with Retry"
+      },
+      "layout": "Vertical list of thick, luxe cards. Each game card uses a subtle gradient or blurred photo backdrop, displaying the game title in Cormorant Garamond, live status chip, schedule, and the latest result in an oversized, high-contrast numeric display. Tapping pushes to Game History."
+    },
+    {
+      "name": "Results",
+      "purpose": "Historical archive of game outcomes, laid out cleanly with high numeric hierarchy.",
+      "states": {
+        "loading": "Skeleton list",
+        "empty": "Empty state illustration, 'No results logged yet.'",
+        "error": "Error state with retry"
+      },
+      "layout": "Date-grouped list. Minimal chrome. High contrast numeric outcomes with subtle dividers. Kept simple for fast scanning."
+    },
+    {
+      "name": "Subscription & Payment",
+      "purpose": "Upgrade wall detailing the 2 tiers (Base vs Pro) and funneling into a manual UPI payment flow.",
+      "states": {
+        "loading": "Loading spinner over glass pane",
+        "empty": "N/A",
+        "error": "Standard error overlay"
+      },
+      "layout": "Presents a 'Centered Block' style view. Side-by-side or stacked tier cards. The Pro card should have a gold-tinted border/gradient to imply superiority. Left-aligned benefits list. Tapping a plan opens a bottom sheet for manual payment: displays the UPI ID (6303514885@ibl) and a generated QR Code (react-native-qrcode-svg). Followed by a sleek input field for the Payment Reference ID and submit. Post-submit shows a vertical status timeline (Pending -> Verified/Rejected)."
+    },
+    {
+      "name": "Notifications",
+      "purpose": "Feed of systemic and game updates.",
+      "states": {
+        "loading": "List skeleton",
+        "empty": "Subtle bell icon, 'All caught up.'",
+        "error": "Retry state"
+      },
+      "layout": "Simple vertical list of notification cells. Unread items have a brandPrimary dot and slight surfaceTertiary background tint."
+    },
+    {
+      "name": "Profile",
+      "purpose": "User management, settings, theme toggle, and the secret gate to the Admin panel.",
+      "states": {
+        "loading": "Skeleton",
+        "empty": "N/A",
+        "error": "Retry state"
+      },
+      "layout": "Top section features the User ID and an elegant initials avatar in a tinted circle. List rows for Settings (Theme, Language, Sound), Legal, and Help. Hidden admin entry triggers on 5 fast taps of the App Version string at the very bottom."
+    },
+    {
+      "name": "Admin Dashboard",
+      "purpose": "Hidden panel for system management: users, games, results, payments, and audit logs.",
+      "states": {
+        "loading": "Skeleton",
+        "empty": "No records found.",
+        "error": "Auth failed or network error."
+      },
+      "layout": "Dense but clean utility layout (leaning slightly more functional but keeping the dark aesthetic). Tabs or a side drawer for managing entities. List views with search/filter for approving UPI payments."
+    }
+  ],
+  "images": {
+    "hero_background": {
+      "url": "https://images.unsplash.com/photo-1616410731303-6affae095a0a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2MzR8MHwxfHNlYXJjaHwxfHx3YXJtJTIwaXZvcnklMjBlbGVnYW50JTIwc3VidGxlJTIwdGV4dHVyZXxlbnwwfHx8fDE3ODg2MTkzNTR8MA&ixlib=rb-4.1.0&q=85",
+      "dark": "https://images.unsplash.com/photo-1513346940221-6f673d962e97?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzV8MHwxfHNlYXJjaHwxfHxsdXh1cnklMjBhYnN0cmFjdCUyMGRhcmslMjBnb2xkJTIwdGV4dHVyZXxlbnwwfHx8fDE3ODg2MTkzNTR8MA&ixlib=rb-4.1.0&q=85",
+      "alt": "Premium abstract texture for hero section"
+    },
+    "premium_card_texture": {
+      "url": "https://images.unsplash.com/photo-1555181937-efe4e074a301?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2MzR8MHwxfHNlYXJjaHwyfHx3YXJtJTIwaXZvcnklMjBlbGVnYW50JTIwc3VidGxlJTIwdGV4dHVyZXxlbnwwfHx8fDE3ODg2MTkzNTR8MA&ixlib=rb-4.1.0&q=85",
+      "dark": "https://images.unsplash.com/photo-1594896733292-9a77b5809c63?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzV8MHwxfHNlYXJjaHwyfHxsdXh1cnklMjBhYnN0cmFjdCUyMGRhcmslMjBnb2xkJTIwdGV4dHVyZXxlbnwwfHx8fDE3ODg2MTkzNTR8MA&ixlib=rb-4.1.0&q=85",
+      "alt": "Gold card textured background"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Strictly adhere to the Glass/Luxe DARK & LIGHT personality. Use deep obsidian/midnight black for dark mode, and warm ivory/off-white for light mode.",
+    "BANNED COLORS: Blue, Purple, Indigo, Pink, Navy. Do not use these anywhere. Stick to the provided gold accents (Brand) and monochrome base colors.",
+    "Implement the User ID card on the Home Screen as a digital pass/wallet card using glassmorphism over the `premium_card_texture` image. It should look like a prestige black card or gold card depending on the tier.",
+    "Use react-native-qrcode-svg for generating the UPI QR code natively on the manual payment screen. Hardcode the UPI string into the generator.",
+    "Hide the admin panel strictly behind a 5-tap gesture on the App Version text in the Profile screen, leading to a PIN/Secret Code modal.",
+    "For typography, use Cormorant Garamond for display headers and Satoshi for body text. Ensure line-heights are generous.",
+    "When applying text over images (e.g., Splash, Hero cards), strictly follow the gradient-to-dark scrim pattern (top to bottom fade to >=70% surfaceInverse) to guarantee WCAG contrast compliance.",
+    "Ensure all interactive elements and buttons possess subtle haptic feedback mapping."
+  ]
+}
