@@ -1,11 +1,21 @@
 // Hidden admin login: email + password + 6-digit PIN. Rate-limited server-side.
+// If a valid admin JWT is already in secure storage, we skip the login form
+// entirely and go straight to the admin dashboard.
 import Feather from "@react-native-vector-icons/feather";
 import { useRouter } from "expo-router";
-import { useState } from "react";
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, View } from "react-native";
+import { useEffect, useState } from "react";
+import {
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  Text,
+  View,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { ApiError, adminApi, setAdminToken } from "@/src/api";
+import { ApiError, adminApi, clearAdminToken, getAdminToken, setAdminToken } from "@/src/api";
 import { Button, Card, Input, Muted } from "@/src/components/ui";
 import { showToast } from "@/src/components/toast";
 import { makeStyles, useTheme } from "@/src/theme";
@@ -21,6 +31,27 @@ export default function AdminLogin() {
   const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
   const [showPass, setShowPass] = useState(false);
+  const [checking, setChecking] = useState(true);
+
+  // Auto-skip: if there's already a valid admin JWT in secure storage, route
+  // straight to the admin dashboard. Only clear + show the form if the token
+  // is missing OR the backend rejects it (expired / revoked).
+  useEffect(() => {
+    (async () => {
+      const token = await getAdminToken();
+      if (!token) {
+        setChecking(false);
+        return;
+      }
+      try {
+        await adminApi.me();
+        router.replace("/admin/(admin)");
+      } catch {
+        await clearAdminToken();
+        setChecking(false);
+      }
+    })();
+  }, [router]);
 
   const submit = async () => {
     if (!email || !password || pin.length !== 6) {
@@ -40,6 +71,14 @@ export default function AdminLogin() {
       setLoading(false);
     }
   };
+
+  if (checking) {
+    return (
+      <View style={[styles.container, { alignItems: "center", justifyContent: "center" }]} testID="admin-login-checking">
+        <ActivityIndicator color={colors.brandPrimary} />
+      </View>
+    );
+  }
 
   return (
     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === "ios" ? "padding" : undefined}>

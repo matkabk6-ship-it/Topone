@@ -38,7 +38,9 @@ DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "topone-api")
 JWT_ALGORITHM = "HS256"
-ADMIN_JWT_MINUTES = 120
+# Admin JWT lifetime. Session persists silently across app restarts as long as
+# the token is not expired or revoked by the backend.
+ADMIN_JWT_MINUTES = 60 * 24 * 30  # 30 days
 UPI_ID = os.environ.get("UPI_ID", "")
 UPI_PAYEE_NAME = os.environ.get("UPI_PAYEE_NAME", "TOP ONE")
 

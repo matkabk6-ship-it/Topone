@@ -6,6 +6,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 
 import {
   api,
+  ApiError,
   clearSessionToken,
   getOrCreateDeviceId,
   getSessionToken,
@@ -39,35 +40,48 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
   const bootstrap = useCallback(async () => {
     try {
+      // 1. Read persisted state up front — do this even if the network is down
+      //    so we know whether to route to onboarding or tabs on relaunch.
       const [existingToken, onboardedRaw] = await Promise.all([
         getSessionToken(),
         storage.getItem(HAS_ONBOARDED_KEY, false),
       ]);
       setHasOnboarded(onboardedRaw === true);
+
+      // 2. If we have no session yet, create one now (first launch on this device).
       if (!existingToken) {
         const deviceId = await getOrCreateDeviceId();
         const init = await api.initUser(deviceId);
         await setSessionToken(init.session_token);
       }
-      const me = await api.me();
-      setUser(me.user);
-      setSubscription(me.subscription);
-      if (me.user?.theme) setColorScheme(me.user.theme as any);
-    } catch (e) {
-      console.warn("[session] bootstrap failed", e);
-      // Try one full reset + re-init if the token was invalid
+
+      // 3. Hydrate the current profile from the backend. If the network fails
+      //    we keep the stored session token so a future launch can reuse it.
       try {
-        await clearSessionToken();
-        const deviceId = await getOrCreateDeviceId();
-        const init = await api.initUser(deviceId);
-        await setSessionToken(init.session_token);
         const me = await api.me();
         setUser(me.user);
         setSubscription(me.subscription);
         if (me.user?.theme) setColorScheme(me.user.theme as any);
       } catch (err) {
-        console.warn("[session] fallback failed", err);
+        if (err instanceof ApiError && err.status === 401) {
+          // The backend explicitly invalidated our session — clear and re-init
+          // with the SAME device id so the user keeps their permanent TOP-ID.
+          await clearSessionToken();
+          const deviceId = await getOrCreateDeviceId();
+          const init = await api.initUser(deviceId);
+          await setSessionToken(init.session_token);
+          const me = await api.me();
+          setUser(me.user);
+          setSubscription(me.subscription);
+          if (me.user?.theme) setColorScheme(me.user.theme as any);
+        } else {
+          // Transient / network error — do NOT clear the token. The app will
+          // render with stale/empty data and screens can retry.
+          console.warn("[session] hydrate failed (offline?)", err);
+        }
       }
+    } catch (e) {
+      console.warn("[session] bootstrap failed", e);
     } finally {
       setReady(true);
     }
