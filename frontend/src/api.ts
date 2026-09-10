@@ -329,8 +329,32 @@ export const adminApi = {
   users: (q?: string) => request<any[]>(`/admin/users${q ? `?q=${encodeURIComponent(q)}` : ""}`, {}, { auth: "admin" }),
   user: (id: string) => request<any>(`/admin/users/${id}`, {}, { auth: "admin" }),
   games: () => request<Game[]>("/admin/games", {}, { auth: "admin" }),
+  createGame: (body: {
+    id: string;
+    name: string;
+    description?: string;
+    open_time?: string;
+    close_time?: string;
+    schedule_note?: string;
+    status?: "active" | "inactive";
+    sort_order?: number;
+  }) =>
+    request<Game>("/admin/games", { method: "POST", body: JSON.stringify(body) }, { auth: "admin" }),
   updateGame: (id: string, body: any) =>
     request<Game>(`/admin/games/${id}`, { method: "PATCH", body: JSON.stringify(body) }, { auth: "admin" }),
+  deleteGame: (id: string) =>
+    request<{ ok: boolean }>(`/admin/games/${id}`, { method: "DELETE" }, { auth: "admin" }),
+  plans: () => request<Plan[]>("/admin/plans", {}, { auth: "admin" }),
+  updatePlan: (id: string, body: {
+    name?: string;
+    price?: number;
+    duration_days?: number;
+    benefits?: { open: number; jodi: number; pane: number };
+    tagline?: string;
+    active?: boolean;
+    sort_order?: number;
+  }) =>
+    request<Plan>(`/admin/plans/${id}`, { method: "PATCH", body: JSON.stringify(body) }, { auth: "admin" }),
   results: (game_id?: string) =>
     request<Result[]>(`/admin/results${game_id ? `?game_id=${game_id}` : ""}`, {}, { auth: "admin" }),
   createResult: (body: any) =>

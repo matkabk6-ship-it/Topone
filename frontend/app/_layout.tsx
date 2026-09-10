@@ -39,6 +39,8 @@ export default function RootLayout() {
                 <Stack.Screen name="legal/[doc]" />
                 <Stack.Screen name="help" />
                 <Stack.Screen name="admin/login" options={{ presentation: "modal" }} />
+                <Stack.Screen name="admin/games" />
+                <Stack.Screen name="admin/plans" />
                 <Stack.Screen name="admin/(admin)" />
               </Stack>
               <ToastHost ref={toastRef} />

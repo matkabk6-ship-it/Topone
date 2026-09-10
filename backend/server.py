@@ -636,7 +636,12 @@ async def _get_active_sub(user_id: str) -> Optional[dict[str, Any]]:
 
 
 async def _activate_subscription(user_id: str, plan_id: str, payment_id: str) -> dict[str, Any]:
-    plan = PLANS[plan_id]
+    plan = await _get_plan(plan_id)
+    if not plan:
+        raise HTTPException(400, "Plan no longer available")
+    benefits = dict(plan.get("benefits", {}))
+    for k in ("open", "jodi", "pane"):
+        benefits.setdefault(k, 0)
     # Deactivate any previous active sub (rare but safe)
     await db.subscriptions.update_many(
         {"user_id": user_id, "status": "active"},
@@ -646,12 +651,12 @@ async def _activate_subscription(user_id: str, plan_id: str, payment_id: str) ->
         "id": str(uuid.uuid4()),
         "user_id": user_id,
         "plan_id": plan_id,
-        "plan_name": plan["name"],
+        "plan_name": plan.get("name", plan_id.title()),
         "status": "active",
         "activated_at": _now(),
-        "expires_at": _now() + timedelta(days=plan["duration_days"]),
-        "benefits_total": dict(plan["benefits"]),
-        "benefits_remaining": dict(plan["benefits"]),
+        "expires_at": _now() + timedelta(days=int(plan.get("duration_days", 30))),
+        "benefits_total": dict(benefits),
+        "benefits_remaining": dict(benefits),
         "linked_payment_id": payment_id,
         "created_at": _now(),
     }
@@ -811,7 +816,8 @@ async def all_results(limit: int = 40):
 # ---------------------------- SUBSCRIPTIONS -----------------------------------
 @api.get("/plans")
 async def list_plans():
-    return list(PLANS.values())
+    cursor = db.plans.find({"active": True}, {"_id": 0}).sort("sort_order", 1)
+    return [sanitize_plan(p) async for p in cursor]
 
 
 @api.get("/subscriptions/me")
@@ -850,9 +856,9 @@ async def payment_config():
 
 @api.post("/payments/submit")
 async def submit_payment(body: SubmitPaymentIn, user=Depends(require_user)):
-    if body.plan_id not in PLANS:
+    plan = await _get_plan(body.plan_id)
+    if not plan or not plan.get("active", True):
         raise HTTPException(400, "Invalid plan")
-    plan = PLANS[body.plan_id]
     # Prevent duplicate: same reference for same user
     existing = await db.payments.find_one({
         "user_id": user["user_id"],
@@ -866,9 +872,9 @@ async def submit_payment(body: SubmitPaymentIn, user=Depends(require_user)):
         "user_id": user["user_id"],
         "top_one_id": user["top_one_id"],
         "plan_id": plan["id"],
-        "plan_name": plan["name"],
-        "amount": plan["price"],
-        "currency": plan["currency"],
+        "plan_name": plan.get("name", plan["id"].title()),
+        "amount": plan.get("price", 0),
+        "currency": plan.get("currency", "INR"),
         "payment_reference": body.payment_reference.strip(),
         "payer_name": body.payer_name,
         "note": body.note,
@@ -879,7 +885,7 @@ async def submit_payment(body: SubmitPaymentIn, user=Depends(require_user)):
     await db.payments.insert_one(dict(payment))
     await _notify_user(user["user_id"], "payment_submitted",
                        "Payment submitted",
-                       f"We received your {plan['name']} payment reference. Our team will verify it shortly.")
+                       f"We received your {plan.get('name')} payment reference. Our team will verify it shortly.")
     return sanitize_payment(payment)
 
 
@@ -1056,6 +1062,50 @@ async def admin_update_game(game_id: str, body: UpdateGameIn, admin=Depends(requ
     await _audit(f"admin:{admin['admin_id']}", "game.update", target=game_id, metadata=update)
     g = await db.games.find_one({"id": game_id}, {"_id": 0})
     return sanitize_game(g)
+
+
+@admin_router.post("/games")
+async def admin_create_game(body: CreateGameIn, admin=Depends(require_admin)):
+    if await db.games.find_one({"id": body.id}):
+        raise HTTPException(409, "A game with this id already exists")
+    game = {**body.model_dump(), "created_at": _now(), "created_by": admin["admin_id"]}
+    await db.games.insert_one(dict(game))
+    await _audit(f"admin:{admin['admin_id']}", "game.create", target=body.id,
+                 metadata={"name": body.name})
+    return sanitize_game(game)
+
+
+@admin_router.delete("/games/{game_id}")
+async def admin_delete_game(game_id: str, admin=Depends(require_admin)):
+    res = await db.games.update_one({"id": game_id}, {"$set": {"status": "deleted"}})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Game not found")
+    await _audit(f"admin:{admin['admin_id']}", "game.delete", target=game_id)
+    return {"ok": True}
+
+
+# ---- Plans (admin editable)
+@admin_router.get("/plans")
+async def admin_list_plans():
+    cursor = db.plans.find({}, {"_id": 0}).sort("sort_order", 1)
+    return [sanitize_plan(p) async for p in cursor]
+
+
+@admin_router.patch("/plans/{plan_id}")
+async def admin_update_plan(plan_id: str, body: UpdatePlanIn, admin=Depends(require_admin)):
+    plan = await _get_plan(plan_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    data = body.model_dump(exclude_none=True)
+    if "benefits" in data:
+        data["benefits"] = dict(data["benefits"])
+    if not data:
+        raise HTTPException(400, "No fields")
+    data["updated_at"] = _now()
+    await db.plans.update_one({"id": plan_id}, {"$set": data})
+    await _audit(f"admin:{admin['admin_id']}", "plan.update", target=plan_id, metadata=data)
+    updated = await db.plans.find_one({"id": plan_id}, {"_id": 0})
+    return sanitize_plan(updated)
 
 
 # ---- Results

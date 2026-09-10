@@ -11,6 +11,11 @@ import { Button, Card, Chip, Empty, Input, Muted, Skeleton } from "@/src/compone
 import { showToast } from "@/src/components/toast";
 import { makeStyles, useTheme } from "@/src/theme";
 
+const MANAGE_LINKS: { id: string; label: string; hint: string; href: string; icon: React.ComponentProps<typeof Feather>["name"] }[] = [
+  { id: "games", label: "Games", hint: "Add or edit games", href: "/admin/games", icon: "grid" },
+  { id: "plans", label: "Plans", hint: "Price · days · benefits", href: "/admin/plans", icon: "award" },
+];
+
 const SECTIONS = [
   { id: "users", label: "Members" },
   { id: "subs", label: "Subscriptions" },
@@ -119,6 +124,29 @@ export default function AdminMore() {
           />
         }
       >
+        {/* Manage links */}
+        <View style={styles.manageRow}>
+          {MANAGE_LINKS.map((m) => (
+            <Pressable
+              key={m.id}
+              style={styles.manageTile}
+              onPress={() => router.push(m.href as any)}
+              testID={`admin-manage-${m.id}`}
+              accessibilityRole="button"
+            >
+              <View style={styles.manageIcon}>
+                <Feather name={m.icon} size={18} color={colors.brandPrimary} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.manageLabel}>{m.label}</Text>
+                <Muted style={{ fontSize: 11 }}>{m.hint}</Muted>
+              </View>
+              <Feather name="chevron-right" size={18} color={colors.muted} />
+            </Pressable>
+          ))}
+        </View>
+        <View style={{ height: 14 }} />
+
         {section === "users" ? (
           <View style={{ gap: 12 }}>
             <Input placeholder="Search by TOP-ID or name" value={q} onChangeText={setQ} autoCapitalize="none" testID="admin-user-search" />
@@ -291,4 +319,27 @@ const useStyles = makeStyles((c) => ({
   chipText: { color: c.onSurfaceSecondary, fontSize: 12, fontWeight: "700" },
   userId: { color: c.brandPrimary, fontSize: 14, fontWeight: "800", letterSpacing: 1.5 },
   userName: { color: c.onSurface, fontSize: 15, fontWeight: "700" },
+  manageRow: { flexDirection: "row", gap: 10, flexWrap: "wrap" },
+  manageTile: {
+    flex: 1,
+    minWidth: "45%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: c.border,
+    backgroundColor: c.surfaceSecondary,
+  },
+  manageIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 999,
+    backgroundColor: c.brandTertiary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  manageLabel: { color: c.onSurface, fontSize: 14, fontWeight: "800" },
 }));
