@@ -113,7 +113,7 @@ export default function Subscription() {
           <CompareRow label="Open" a="3" b="1" />
           <CompareRow label="Jodi" a="6" b="2" />
           <CompareRow label="Pane" a="—" b="2" />
-          <CompareRow label="Duration" a="30 days" b="30 days" last />
+          <CompareRow label="Duration" a="07 days" b="07 days" last />
         </Card>
 
         <Muted style={{ textAlign: "center", fontSize: 12, marginTop: 12 }}>
