@@ -2,13 +2,15 @@
 
 Handles anonymous user sessions, admin auth (email+password+6-digit PIN),
 games, results, subscriptions, manual UPI payments, notifications, audit logs.
+
+Storage: Supabase Postgres (accessed directly via asyncpg — no ORM).
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
-import random
 import secrets
 import string
 import time
@@ -18,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
+import asyncpg
 import bcrypt
 import jwt
 from dotenv import load_dotenv
@@ -25,7 +28,6 @@ from fastapi import (APIRouter, Depends, FastAPI, Header, HTTPException,
                      Request, status)
 from fastapi.security import OAuth2PasswordBearer
 from jwt.exceptions import InvalidTokenError
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from starlette.middleware.cors import CORSMiddleware
 
@@ -33,8 +35,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 # -- Config --------------------------------------------------------------------
-MONGO_URL = os.environ["MONGO_URL"]
-DB_NAME = os.environ["DB_NAME"]
+DATABASE_URL = os.environ["DATABASE_URL"]  # Supabase Postgres connection string
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "topone-api")
 JWT_ALGORITHM = "HS256"
@@ -49,9 +50,213 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("topone")
 
-# -- Mongo client (motor) ------------------------------------------------------
-mongo_client = AsyncIOMotorClient(MONGO_URL, tz_aware=True, tzinfo=timezone.utc)
-db = mongo_client[DB_NAME]
+# -- Postgres pool (asyncpg) -----------------------------------------------------
+pool: asyncpg.Pool  # set in lifespan()
+
+
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    # Make jsonb columns behave like plain Python dicts, in/out.
+    await conn.set_type_codec(
+        "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog",
+    )
+
+
+async def fetchrow(query: str, *args: Any) -> Optional[dict[str, Any]]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(query, *args)
+        return dict(row) if row else None
+
+
+async def fetchall(query: str, *args: Any) -> list[dict[str, Any]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query, *args)
+        return [dict(r) for r in rows]
+
+
+async def execute(query: str, *args: Any) -> str:
+    async with pool.acquire() as conn:
+        return await conn.execute(query, *args)
+
+
+async def _update_row(table: str, pk_col: str, pk_val: str,
+                       fields: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Build and run `UPDATE {table} SET ... WHERE {pk_col}=$n RETURNING *`."""
+    if not fields:
+        return await fetchrow(f"SELECT * FROM {table} WHERE {pk_col} = $1", pk_val)
+    set_parts = []
+    values: list[Any] = []
+    idx = 1
+    for k, v in fields.items():
+        set_parts.append(f"{k} = ${idx}")
+        values.append(v)
+        idx += 1
+    values.append(pk_val)
+    query = f"UPDATE {table} SET {', '.join(set_parts)} WHERE {pk_col} = ${idx} RETURNING *"
+    return await fetchrow(query, *values)
+
+
+# -- Schema (idempotent — safe to run on every startup) -------------------------
+SCHEMA_SQL = """
+create table if not exists users (
+  user_id text primary key,
+  device_id_hash text unique not null,
+  top_one_id text unique not null,
+  display_name text,
+  theme text not null default 'dark',
+  notifications_enabled boolean not null default true,
+  sound_enabled boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create table if not exists user_sessions (
+  token_hash text primary key,
+  user_id text not null references users(user_id) on delete cascade,
+  device_id_hash text not null,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_user_sessions_expires on user_sessions(expires_at);
+create table if not exists admins (
+  admin_id text primary key,
+  email text unique not null,
+  password_hash text not null,
+  pin_hash text not null,
+  role text not null default 'admin',
+  created_at timestamptz not null default now()
+);
+create table if not exists games (
+  id text primary key,
+  name text not null,
+  description text not null default '',
+  open_time text,
+  close_time text,
+  schedule_note text not null default '',
+  status text not null default 'active',
+  sort_order int not null default 99,
+  created_at timestamptz not null default now(),
+  created_by text
+);
+create table if not exists results (
+  id text primary key,
+  game_id text not null references games(id),
+  date text not null,
+  session text,
+  open_pana text,
+  open_digit text,
+  jodi text,
+  close_pana text,
+  close_digit text,
+  status text not null default 'published',
+  published_at timestamptz,
+  created_at timestamptz not null default now(),
+  created_by text
+);
+create index if not exists idx_results_game_date on results(game_id, date desc);
+create table if not exists plans (
+  id text primary key,
+  name text not null,
+  price int not null default 0,
+  currency text not null default 'INR',
+  benefits jsonb not null default '{}'::jsonb,
+  duration_days int not null default 30,
+  tagline text not null default '',
+  active boolean not null default true,
+  sort_order int not null default 99,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz
+);
+create table if not exists payments (
+  id text primary key,
+  user_id text not null references users(user_id),
+  top_one_id text,
+  plan_id text not null,
+  plan_name text,
+  amount int not null default 0,
+  currency text not null default 'INR',
+  payment_reference text not null,
+  payer_name text,
+  note text,
+  status text not null default 'pending',
+  reject_reason text,
+  submitted_at timestamptz,
+  verified_at timestamptz,
+  verified_by text,
+  subscription_id text,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_payments_user on payments(user_id);
+create unique index if not exists idx_payments_user_ref on payments(user_id, payment_reference);
+create table if not exists subscriptions (
+  id text primary key,
+  user_id text not null references users(user_id),
+  plan_id text not null,
+  plan_name text,
+  status text not null default 'active',
+  activated_at timestamptz,
+  expires_at timestamptz,
+  benefits_total jsonb not null default '{}'::jsonb,
+  benefits_remaining jsonb not null default '{}'::jsonb,
+  linked_payment_id text,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_subs_user on subscriptions(user_id);
+create table if not exists notifications (
+  id text primary key,
+  user_id text not null,
+  type text not null default 'system',
+  title text not null,
+  message text not null,
+  read boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_notif_user_created on notifications(user_id, created_at desc);
+create table if not exists announcements (
+  id text primary key,
+  title text not null,
+  message text not null,
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create table if not exists tips (
+  id text primary key,
+  game_id text not null,
+  tip_type text not null,
+  value text not null,
+  session text,
+  note text,
+  audience text not null,
+  for_date text,
+  created_at timestamptz not null default now(),
+  created_by text
+);
+create index if not exists idx_tips_created on tips(created_at desc);
+create index if not exists idx_tips_audience_created on tips(audience, created_at desc);
+create table if not exists settings (
+  key text primary key,
+  upi_id text,
+  payee_name text,
+  instructions text,
+  updated_at timestamptz not null default now()
+);
+create table if not exists audit_logs (
+  id text primary key,
+  actor text,
+  action text,
+  target text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_audit_created on audit_logs(created_at desc);
+create table if not exists support_tickets (
+  id text primary key,
+  user_id text not null,
+  top_one_id text,
+  subject text not null,
+  message text not null,
+  category text not null default 'general',
+  status text not null default 'open',
+  created_at timestamptz not null default now()
+);
+"""
 
 # -- Rate limiter (in-memory) --------------------------------------------------
 _login_attempts: dict[str, list[float]] = {}
@@ -118,41 +323,26 @@ def _create_admin_token(admin_id: str, email: str) -> str:
 
 
 # -- Domain constants ----------------------------------------------------------
-# Default plan config — seeded once into the `plans` collection so the admin
-# can edit price / duration / benefits from the UI. The keys "base" and "pro"
-# are stable identifiers; the admin edits everything else.
 DEFAULT_PLANS: list[dict[str, Any]] = [
     {
-        "id": "base",
-        "name": "Base Plan",
-        "price": 299,
-        "currency": "INR",
-        "benefits": {"open": 3, "jodi": 6, "pane": 0},
-        "duration_days": 30,
-        "tagline": "3 Open, 6 Jodi",
-        "active": True,
-        "sort_order": 1,
+        "id": "base", "name": "Base Plan", "price": 299, "currency": "INR",
+        "benefits": {"open": 3, "jodi": 6, "pane": 0}, "duration_days": 30,
+        "tagline": "3 Open, 6 Jodi", "active": True, "sort_order": 1,
     },
     {
-        "id": "pro",
-        "name": "Pro Plan",
-        "price": 599,
-        "currency": "INR",
-        "benefits": {"open": 1, "jodi": 2, "pane": 2},
-        "duration_days": 30,
-        "tagline": "1 Open, 2 Jodi, 2 Pane",
-        "active": True,
-        "sort_order": 2,
+        "id": "pro", "name": "Pro Plan", "price": 599, "currency": "INR",
+        "benefits": {"open": 1, "jodi": 2, "pane": 2}, "duration_days": 30,
+        "tagline": "1 Open, 2 Jodi, 2 Pane", "active": True, "sort_order": 2,
     },
 ]
 
 
 async def _get_plan(plan_id: str) -> Optional[dict[str, Any]]:
-    return await db.plans.find_one({"id": plan_id}, {"_id": 0})
+    return await fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
 
 
 def sanitize_plan(p: dict[str, Any]) -> dict[str, Any]:
-    benefits = dict(p.get("benefits", {}))
+    benefits = dict(p.get("benefits") or {})
     for k in ("open", "jodi", "pane"):
         benefits.setdefault(k, 0)
     return {
@@ -457,30 +647,7 @@ def sanitize_tip(t: dict[str, Any]) -> dict[str, Any]:
 
 # -- Startup / seed ------------------------------------------------------------
 async def seed_data() -> None:
-    # Indexes
-    await db.users.create_index("user_id", unique=True)
-    await db.users.create_index("device_id_hash", unique=True)
-    await db.users.create_index("top_one_id", unique=True)
-    await db.user_sessions.create_index("token_hash", unique=True)
-    await db.user_sessions.create_index("expires_at")
-    await db.admins.create_index("email", unique=True)
-    await db.games.create_index("id", unique=True)
-    await db.results.create_index("id", unique=True)
-    await db.results.create_index([("game_id", 1), ("date", -1)])
-    await db.payments.create_index("id", unique=True)
-    await db.payments.create_index("user_id")
-    await db.subscriptions.create_index("id", unique=True)
-    await db.subscriptions.create_index("user_id")
-    await db.notifications.create_index("id", unique=True)
-    await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
-    await db.announcements.create_index("id", unique=True)
-    await db.audit_logs.create_index("id", unique=True)
-    await db.audit_logs.create_index("created_at")
-    await db.tips.create_index("id", unique=True)
-    await db.tips.create_index([("created_at", -1)])
-    await db.tips.create_index([("audience", 1), ("created_at", -1)])
-    await db.settings.create_index("key", unique=True)
-    await db.support_tickets.create_index("id", unique=True)
+    await execute(SCHEMA_SQL)
 
     # Seed admin (idempotent)
     admin_email = os.environ["ADMIN_EMAIL"].strip().lower()
@@ -488,71 +655,64 @@ async def seed_data() -> None:
     admin_pin = os.environ["ADMIN_PIN"]
     if len(admin_pin) != 6 or not admin_pin.isdigit():
         raise RuntimeError("ADMIN_PIN must be 6 digits")
-    existing = await db.admins.find_one({"email": admin_email})
+    existing = await fetchrow("SELECT admin_id FROM admins WHERE email = $1", admin_email)
     if not existing:
-        await db.admins.insert_one({
-            "admin_id": str(uuid.uuid4()),
-            "email": admin_email,
-            "password_hash": _hash_bcrypt(admin_password),
-            "pin_hash": _hash_bcrypt(admin_pin),
-            "role": "admin",
-            "created_at": _now(),
-        })
+        await execute(
+            "INSERT INTO admins (admin_id, email, password_hash, pin_hash, role) "
+            "VALUES ($1, $2, $3, $4, 'admin')",
+            str(uuid.uuid4()), admin_email, _hash_bcrypt(admin_password), _hash_bcrypt(admin_pin),
+        )
         logger.info("Seeded admin %s", admin_email)
 
     # Seed games (idempotent)
     for g in DEFAULT_GAMES:
-        await db.games.update_one(
-            {"id": g["id"]},
-            {"$setOnInsert": {**g, "created_at": _now()}},
-            upsert=True,
+        await execute(
+            "INSERT INTO games (id, name, description, open_time, close_time, schedule_note, "
+            "status, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING",
+            g["id"], g["name"], g["description"], g["open_time"], g["close_time"],
+            g["schedule_note"], g["status"], g["sort_order"],
         )
 
     # Seed plans (idempotent — existing edits stay)
     for p in DEFAULT_PLANS:
-        await db.plans.update_one(
-            {"id": p["id"]},
-            {"$setOnInsert": {**p, "created_at": _now()}},
-            upsert=True,
+        await execute(
+            "INSERT INTO plans (id, name, price, currency, benefits, duration_days, tagline, "
+            "active, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING",
+            p["id"], p["name"], p["price"], p["currency"], p["benefits"], p["duration_days"],
+            p["tagline"], p["active"], p["sort_order"],
         )
-    await db.plans.create_index("id", unique=True)
 
     # Seed payment settings
-    await db.settings.update_one(
-        {"key": "payment_config"},
-        {"$setOnInsert": {
-            "key": "payment_config",
-            "upi_id": UPI_ID,
-            "payee_name": UPI_PAYEE_NAME,
-            "instructions": (
-                "1. Open any UPI app (GPay, PhonePe, Paytm, BHIM).\n"
-                "2. Send the exact plan amount to the UPI ID above or scan the QR.\n"
-                "3. Copy the UTR / Transaction ID after payment.\n"
-                "4. Return here and submit that reference in the form below.\n"
-                "5. Your subscription activates once our team verifies the payment."
-            ),
-            "updated_at": _now(),
-        }},
-        upsert=True,
+    await execute(
+        "INSERT INTO settings (key, upi_id, payee_name, instructions) VALUES ($1,$2,$3,$4) "
+        "ON CONFLICT (key) DO NOTHING",
+        "payment_config", UPI_ID, UPI_PAYEE_NAME,
+        "1. Open any UPI app (GPay, PhonePe, Paytm, BHIM).\n"
+        "2. Send the exact plan amount to the UPI ID above or scan the QR.\n"
+        "3. Copy the UTR / Transaction ID after payment.\n"
+        "4. Return here and submit that reference in the form below.\n"
+        "5. Your subscription activates once our team verifies the payment.",
     )
 
     # Seed a default welcome announcement (idempotent)
-    if not await db.announcements.find_one({"title": "Welcome to TOP ONE"}):
-        await db.announcements.insert_one({
-            "id": str(uuid.uuid4()),
-            "title": "Welcome to TOP ONE",
-            "message": ("Your premium membership dashboard is ready. "
-                        "Explore the games, subscribe to unlock benefits, and enjoy the club."),
-            "active": True,
-            "created_at": _now(),
-        })
+    existing_ann = await fetchrow("SELECT id FROM announcements WHERE title = $1", "Welcome to TOP ONE")
+    if not existing_ann:
+        await execute(
+            "INSERT INTO announcements (id, title, message, active) VALUES ($1,$2,$3,$4)",
+            str(uuid.uuid4()), "Welcome to TOP ONE",
+            "Your premium membership dashboard is ready. Explore the games, subscribe to "
+            "unlock benefits, and enjoy the club.",
+            True,
+        )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, init=_init_connection, min_size=1, max_size=10)
     await seed_data()
     yield
-    mongo_client.close()
+    await pool.close()
 
 
 app = FastAPI(title="TOP ONE API", lifespan=lifespan)
@@ -569,14 +729,14 @@ async def require_user(
     if not authorization or not authorization.startswith("Bearer ") or not x_device_id:
         raise _unauth()
     raw = authorization[7:].strip()
-    session = await db.user_sessions.find_one({
-        "token_hash": _sha256(raw),
-        "device_id_hash": _sha256(x_device_id),
-        "expires_at": {"$gt": _now()},
-    })
+    session = await fetchrow(
+        "SELECT * FROM user_sessions WHERE token_hash = $1 AND device_id_hash = $2 "
+        "AND expires_at > now()",
+        _sha256(raw), _sha256(x_device_id),
+    )
     if not session:
         raise _unauth()
-    user = await db.users.find_one({"user_id": session["user_id"]})
+    user = await fetchrow("SELECT * FROM users WHERE user_id = $1", session["user_id"])
     if not user:
         raise _unauth()
     return user
@@ -595,7 +755,7 @@ async def require_admin(token: Annotated[Optional[str], Depends(oauth2)]) -> dic
         admin_id = payload["sub"].split(":", 1)[1]
     except (InvalidTokenError, ValueError, TypeError, KeyError):
         raise _unauth()
-    admin = await db.admins.find_one({"admin_id": admin_id})
+    admin = await fetchrow("SELECT * FROM admins WHERE admin_id = $1", admin_id)
     if not admin:
         raise _unauth()
     return admin
@@ -603,22 +763,17 @@ async def require_admin(token: Annotated[Optional[str], Depends(oauth2)]) -> dic
 
 # -- Audit log helper ----------------------------------------------------------
 async def _audit(actor: str, action: str, target: str = "", metadata: Optional[dict] = None) -> None:
-    await db.audit_logs.insert_one({
-        "id": str(uuid.uuid4()),
-        "actor": actor,
-        "action": action,
-        "target": target,
-        "metadata": metadata or {},
-        "created_at": _now(),
-    })
+    await execute(
+        "INSERT INTO audit_logs (id, actor, action, target, metadata) VALUES ($1,$2,$3,$4,$5)",
+        str(uuid.uuid4()), actor, action, target, metadata or {},
+    )
 
 
 # -- Subscription helpers ------------------------------------------------------
 async def _expire_subscription_if_needed(sub: dict[str, Any]) -> dict[str, Any]:
     if sub.get("status") == "active" and sub.get("expires_at") and sub["expires_at"] < _now():
-        await db.subscriptions.update_one({"id": sub["id"]}, {"$set": {"status": "expired"}})
+        await execute("UPDATE subscriptions SET status = 'expired' WHERE id = $1", sub["id"])
         sub["status"] = "expired"
-        # Notify
         await _notify_user(sub["user_id"], "subscription_expired",
                            "Subscription expired",
                            f"Your {sub.get('plan_name')} subscription has expired. Purchase again to keep enjoying benefits.")
@@ -626,9 +781,10 @@ async def _expire_subscription_if_needed(sub: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _get_active_sub(user_id: str) -> Optional[dict[str, Any]]:
-    sub = await db.subscriptions.find_one(
-        {"user_id": user_id, "status": "active"},
-        sort=[("activated_at", -1)],
+    sub = await fetchrow(
+        "SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active' "
+        "ORDER BY activated_at DESC LIMIT 1",
+        user_id,
     )
     if sub:
         sub = await _expire_subscription_if_needed(sub)
@@ -641,42 +797,40 @@ async def _activate_subscription(user_id: str, plan_id: str, payment_id: str) ->
     plan = await _get_plan(plan_id)
     if not plan:
         raise HTTPException(400, "Plan no longer available")
-    benefits = dict(plan.get("benefits", {}))
+    benefits = dict(plan.get("benefits") or {})
     for k in ("open", "jodi", "pane"):
         benefits.setdefault(k, 0)
     # Deactivate any previous active sub (rare but safe)
-    await db.subscriptions.update_many(
-        {"user_id": user_id, "status": "active"},
-        {"$set": {"status": "expired"}},
+    await execute(
+        "UPDATE subscriptions SET status = 'expired' WHERE user_id = $1 AND status = 'active'",
+        user_id,
     )
-    sub = {
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "plan_id": plan_id,
-        "plan_name": plan.get("name", plan_id.title()),
-        "status": "active",
-        "activated_at": _now(),
-        "expires_at": _now() + timedelta(days=int(plan.get("duration_days", 30))),
-        "benefits_total": dict(benefits),
-        "benefits_remaining": dict(benefits),
+    sub_id = str(uuid.uuid4())
+    activated_at = _now()
+    expires_at = activated_at + timedelta(days=int(plan.get("duration_days", 30)))
+    plan_name = plan.get("name", plan_id.title())
+    await execute(
+        "INSERT INTO subscriptions (id, user_id, plan_id, plan_name, status, activated_at, "
+        "expires_at, benefits_total, benefits_remaining, linked_payment_id) "
+        "VALUES ($1,$2,$3,$4,'active',$5,$6,$7,$8,$9)",
+        sub_id, user_id, plan_id, plan_name, activated_at, expires_at,
+        dict(benefits), dict(benefits), payment_id,
+    )
+    return {
+        "id": sub_id, "user_id": user_id, "plan_id": plan_id, "plan_name": plan_name,
+        "status": "active", "activated_at": activated_at, "expires_at": expires_at,
+        "benefits_total": dict(benefits), "benefits_remaining": dict(benefits),
         "linked_payment_id": payment_id,
-        "created_at": _now(),
     }
-    await db.subscriptions.insert_one(dict(sub))
-    return sub
 
 
 # -- Notification helper -------------------------------------------------------
 async def _notify_user(user_id: str, type_: str, title: str, message: str) -> None:
-    await db.notifications.insert_one({
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "type": type_,
-        "title": title,
-        "message": message,
-        "read": False,
-        "created_at": _now(),
-    })
+    await execute(
+        "INSERT INTO notifications (id, user_id, type, title, message, read) "
+        "VALUES ($1,$2,$3,$4,$5,false)",
+        str(uuid.uuid4()), user_id, type_, title, message,
+    )
 
 
 # ============================================================================
@@ -696,43 +850,35 @@ async def health():
 @api.post("/users/init", response_model=InitUserOut)
 async def init_user(body: InitUserIn):
     device_hash = _sha256(body.device_id)
-    user = await db.users.find_one({"device_id_hash": device_hash})
+    user = await fetchrow("SELECT * FROM users WHERE device_id_hash = $1", device_hash)
     is_new = False
     if not user:
         is_new = True
         # Ensure unique top_one_id
         for _ in range(6):
             candidate = _generate_top_one_id()
-            if not await db.users.find_one({"top_one_id": candidate}):
+            if not await fetchrow("SELECT 1 FROM users WHERE top_one_id = $1", candidate):
                 break
         else:
             raise HTTPException(500, "Could not allocate ID")
         user_id = str(uuid.uuid4())
-        doc = {
-            "user_id": user_id,
-            "device_id_hash": device_hash,
-            "top_one_id": candidate,
-            "display_name": body.display_name,
-            "theme": "dark",
-            "notifications_enabled": True,
-            "sound_enabled": True,
-            "created_at": _now(),
-        }
-        await db.users.insert_one(doc)
-        user = await db.users.find_one({"user_id": user_id})
+        await execute(
+            "INSERT INTO users (user_id, device_id_hash, top_one_id, display_name, theme, "
+            "notifications_enabled, sound_enabled) VALUES ($1,$2,$3,$4,'dark',true,true)",
+            user_id, device_hash, candidate, body.display_name,
+        )
+        user = await fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
         # Welcome notification
         await _notify_user(user_id, "system", "Welcome to TOP ONE",
                            f"Your TOP ONE ID is {user['top_one_id']}. Copy it from your dashboard any time.")
 
     # Create session
     raw = secrets.token_urlsafe(32)
-    await db.user_sessions.insert_one({
-        "token_hash": _sha256(raw),
-        "user_id": user["user_id"],
-        "device_id_hash": device_hash,
-        "expires_at": _now() + timedelta(days=90),
-        "created_at": _now(),
-    })
+    await execute(
+        "INSERT INTO user_sessions (token_hash, user_id, device_id_hash, expires_at) "
+        "VALUES ($1,$2,$3,$4)",
+        _sha256(raw), user["user_id"], device_hash, _now() + timedelta(days=90),
+    )
     return InitUserOut(
         user_id=user["user_id"],
         session_token=raw,
@@ -752,9 +898,7 @@ async def get_me(user=Depends(require_user)):
 @api.patch("/users/me")
 async def update_me(body: UpdateProfileIn, user=Depends(require_user)):
     update = {k: v for k, v in body.model_dump(exclude_none=True).items()}
-    if update:
-        await db.users.update_one({"user_id": user["user_id"]}, {"$set": update})
-    updated = await db.users.find_one({"user_id": user["user_id"]})
+    updated = await _update_row("users", "user_id", user["user_id"], update)
     return sanitize_user(updated)
 
 
@@ -765,24 +909,25 @@ async def logout(
 ):
     if authorization and authorization.startswith("Bearer "):
         raw = authorization[7:].strip()
-        await db.user_sessions.delete_one({"token_hash": _sha256(raw)})
+        await execute("DELETE FROM user_sessions WHERE token_hash = $1", _sha256(raw))
     return {"ok": True}
 
 
 # ---------------------------- GAMES & RESULTS ---------------------------------
 async def _latest_result_for(game_id: str) -> Optional[dict[str, Any]]:
-    r = await db.results.find_one(
-        {"game_id": game_id, "status": "published"},
-        sort=[("date", -1), ("published_at", -1)],
+    r = await fetchrow(
+        "SELECT * FROM results WHERE game_id = $1 AND status = 'published' "
+        "ORDER BY date DESC, published_at DESC LIMIT 1",
+        game_id,
     )
     return sanitize_result(r) if r else None
 
 
 @api.get("/games")
 async def list_games():
-    cursor = db.games.find({"status": {"$ne": "deleted"}}, {"_id": 0}).sort("sort_order", 1)
+    rows = await fetchall("SELECT * FROM games WHERE status != 'deleted' ORDER BY sort_order ASC")
     games = []
-    async for g in cursor:
+    for g in rows:
         latest = await _latest_result_for(g["id"])
         games.append(sanitize_game(g, latest))
     return games
@@ -790,7 +935,7 @@ async def list_games():
 
 @api.get("/games/{game_id}")
 async def get_game(game_id: str):
-    g = await db.games.find_one({"id": game_id}, {"_id": 0})
+    g = await fetchrow("SELECT * FROM games WHERE id = $1", game_id)
     if not g:
         raise HTTPException(404, "Game not found")
     latest = await _latest_result_for(game_id)
@@ -800,26 +945,30 @@ async def get_game(game_id: str):
 @api.get("/games/{game_id}/results")
 async def game_results(game_id: str, limit: int = 30):
     limit = max(1, min(limit, 100))
-    cursor = db.results.find(
-        {"game_id": game_id, "status": "published"},
-        {"_id": 0},
-    ).sort([("date", -1), ("published_at", -1)]).limit(limit)
-    return [sanitize_result(r) async for r in cursor]
+    rows = await fetchall(
+        "SELECT * FROM results WHERE game_id = $1 AND status = 'published' "
+        "ORDER BY date DESC, published_at DESC LIMIT $2",
+        game_id, limit,
+    )
+    return [sanitize_result(r) for r in rows]
 
 
 @api.get("/results")
 async def all_results(limit: int = 40):
     limit = max(1, min(limit, 100))
-    cursor = db.results.find({"status": "published"}, {"_id": 0}) \
-        .sort([("date", -1), ("published_at", -1)]).limit(limit)
-    return [sanitize_result(r) async for r in cursor]
+    rows = await fetchall(
+        "SELECT * FROM results WHERE status = 'published' "
+        "ORDER BY date DESC, published_at DESC LIMIT $1",
+        limit,
+    )
+    return [sanitize_result(r) for r in rows]
 
 
 # ---------------------------- SUBSCRIPTIONS -----------------------------------
 @api.get("/plans")
 async def list_plans():
-    cursor = db.plans.find({"active": True}, {"_id": 0}).sort("sort_order", 1)
-    return [sanitize_plan(p) async for p in cursor]
+    rows = await fetchall("SELECT * FROM plans WHERE active = true ORDER BY sort_order ASC")
+    return [sanitize_plan(p) for p in rows]
 
 
 @api.get("/subscriptions/me")
@@ -833,14 +982,14 @@ async def use_benefit(body: UseBenefitIn, user=Depends(require_user)):
     sub = await _get_active_sub(user["user_id"])
     if not sub:
         raise HTTPException(400, "No active subscription")
-    remaining = sub.get("benefits_remaining", {})
+    remaining = dict(sub.get("benefits_remaining", {}))
     left = remaining.get(body.benefit_type, 0)
     if left <= 0:
         raise HTTPException(400, "No benefits remaining for this type")
     remaining[body.benefit_type] = left - 1
-    await db.subscriptions.update_one(
-        {"id": sub["id"]},
-        {"$set": {"benefits_remaining": remaining}},
+    await execute(
+        "UPDATE subscriptions SET benefits_remaining = $1 WHERE id = $2",
+        remaining, sub["id"],
     )
     sub["benefits_remaining"] = remaining
     return sanitize_subscription(sub)
@@ -849,7 +998,7 @@ async def use_benefit(body: UseBenefitIn, user=Depends(require_user)):
 # ---------------------------- PAYMENTS ----------------------------------------
 @api.get("/payments/config")
 async def payment_config():
-    cfg = await db.settings.find_one({"key": "payment_config"}, {"_id": 0})
+    cfg = await fetchrow("SELECT * FROM settings WHERE key = 'payment_config'")
     if not cfg:
         raise HTTPException(500, "Payment not configured")
     return {"upi_id": cfg.get("upi_id"), "payee_name": cfg.get("payee_name"),
@@ -862,68 +1011,71 @@ async def submit_payment(body: SubmitPaymentIn, user=Depends(require_user)):
     if not plan or not plan.get("active", True):
         raise HTTPException(400, "Invalid plan")
     # Prevent duplicate: same reference for same user
-    existing = await db.payments.find_one({
-        "user_id": user["user_id"],
-        "payment_reference": body.payment_reference.strip(),
-    })
+    existing = await fetchrow(
+        "SELECT 1 FROM payments WHERE user_id = $1 AND payment_reference = $2",
+        user["user_id"], body.payment_reference.strip(),
+    )
     if existing:
         raise HTTPException(409, "This payment reference is already submitted")
 
-    payment = {
-        "id": str(uuid.uuid4()),
-        "user_id": user["user_id"],
-        "top_one_id": user["top_one_id"],
-        "plan_id": plan["id"],
-        "plan_name": plan.get("name", plan["id"].title()),
-        "amount": plan.get("price", 0),
-        "currency": plan.get("currency", "INR"),
-        "payment_reference": body.payment_reference.strip(),
-        "payer_name": body.payer_name,
-        "note": body.note,
-        "status": "pending",
-        "submitted_at": _now(),
-        "created_at": _now(),
-    }
-    await db.payments.insert_one(dict(payment))
+    payment_id = str(uuid.uuid4())
+    submitted_at = _now()
+    plan_name = plan.get("name", plan["id"].title())
+    amount = plan.get("price", 0)
+    currency = plan.get("currency", "INR")
+    await execute(
+        "INSERT INTO payments (id, user_id, top_one_id, plan_id, plan_name, amount, currency, "
+        "payment_reference, payer_name, note, status, submitted_at) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11)",
+        payment_id, user["user_id"], user["top_one_id"], plan["id"], plan_name, amount, currency,
+        body.payment_reference.strip(), body.payer_name, body.note, submitted_at,
+    )
     await _notify_user(user["user_id"], "payment_submitted",
                        "Payment submitted",
-                       f"We received your {plan.get('name')} payment reference. Our team will verify it shortly.")
-    return sanitize_payment(payment)
+                       f"We received your {plan_name} payment reference. Our team will verify it shortly.")
+    return sanitize_payment({
+        "id": payment_id, "user_id": user["user_id"], "top_one_id": user["top_one_id"],
+        "plan_id": plan["id"], "plan_name": plan_name, "amount": amount, "currency": currency,
+        "payment_reference": body.payment_reference.strip(), "payer_name": body.payer_name,
+        "note": body.note, "status": "pending", "submitted_at": submitted_at,
+    })
 
 
 @api.get("/payments/me")
 async def my_payments(user=Depends(require_user)):
-    cursor = db.payments.find({"user_id": user["user_id"]}, {"_id": 0}) \
-        .sort("submitted_at", -1)
-    return [sanitize_payment(p) async for p in cursor]
+    rows = await fetchall(
+        "SELECT * FROM payments WHERE user_id = $1 ORDER BY submitted_at DESC",
+        user["user_id"],
+    )
+    return [sanitize_payment(p) for p in rows]
 
 
 # ---------------------------- NOTIFICATIONS -----------------------------------
 @api.get("/notifications")
 async def my_notifications(user=Depends(require_user), limit: int = 50):
     limit = max(1, min(limit, 100))
-    # Include both user-specific and broadcast (user_id == "*")
-    cursor = db.notifications.find(
-        {"$or": [{"user_id": user["user_id"]}, {"user_id": "*"}]},
-        {"_id": 0},
-    ).sort("created_at", -1).limit(limit)
-    return [sanitize_notification(n) async for n in cursor]
+    rows = await fetchall(
+        "SELECT * FROM notifications WHERE user_id = $1 OR user_id = '*' "
+        "ORDER BY created_at DESC LIMIT $2",
+        user["user_id"], limit,
+    )
+    return [sanitize_notification(n) for n in rows]
 
 
 @api.post("/notifications/read-all")
 async def mark_all_read(user=Depends(require_user)):
-    await db.notifications.update_many(
-        {"$or": [{"user_id": user["user_id"]}, {"user_id": "*"}], "read": False},
-        {"$set": {"read": True}},
+    await execute(
+        "UPDATE notifications SET read = true WHERE (user_id = $1 OR user_id = '*') AND read = false",
+        user["user_id"],
     )
     return {"ok": True}
 
 
 @api.post("/notifications/{nid}/read")
 async def mark_read(nid: str, user=Depends(require_user)):
-    await db.notifications.update_one(
-        {"id": nid, "$or": [{"user_id": user["user_id"]}, {"user_id": "*"}]},
-        {"$set": {"read": True}},
+    await execute(
+        "UPDATE notifications SET read = true WHERE id = $1 AND (user_id = $2 OR user_id = '*')",
+        nid, user["user_id"],
     )
     return {"ok": True}
 
@@ -931,8 +1083,10 @@ async def mark_read(nid: str, user=Depends(require_user)):
 # ---------------------------- ANNOUNCEMENTS -----------------------------------
 @api.get("/announcements")
 async def announcements():
-    cursor = db.announcements.find({"active": True}, {"_id": 0}).sort("created_at", -1).limit(10)
-    return [sanitize_announcement(a) async for a in cursor]
+    rows = await fetchall(
+        "SELECT * FROM announcements WHERE active = true ORDER BY created_at DESC LIMIT 10"
+    )
+    return [sanitize_announcement(a) for a in rows]
 
 
 # ---------------------------- TIPS (subscribers only) ------------------------
@@ -947,28 +1101,23 @@ async def my_tips(user=Depends(require_user), limit: int = 50):
     plan = sub["plan_id"]  # "base" | "pro"
     audiences = [plan, "both"]
     limit = max(1, min(limit, 100))
-    cursor = db.tips.find(
-        {"audience": {"$in": audiences}},
-        {"_id": 0},
-    ).sort("created_at", -1).limit(limit)
-    return {"tips": [sanitize_tip(t) async for t in cursor], "plan": plan}
+    rows = await fetchall(
+        "SELECT * FROM tips WHERE audience = ANY($1) ORDER BY created_at DESC LIMIT $2",
+        audiences, limit,
+    )
+    return {"tips": [sanitize_tip(t) for t in rows], "plan": plan}
 
 
 # ---------------------------- SUPPORT -----------------------------------------
 @api.post("/support/ticket")
 async def create_ticket(body: SupportTicketIn, user=Depends(require_user)):
-    t = {
-        "id": str(uuid.uuid4()),
-        "user_id": user["user_id"],
-        "top_one_id": user["top_one_id"],
-        "subject": body.subject,
-        "message": body.message,
-        "category": body.category,
-        "status": "open",
-        "created_at": _now(),
-    }
-    await db.support_tickets.insert_one(dict(t))
-    return {"id": t["id"], "status": t["status"]}
+    ticket_id = str(uuid.uuid4())
+    await execute(
+        "INSERT INTO support_tickets (id, user_id, top_one_id, subject, message, category, status) "
+        "VALUES ($1,$2,$3,$4,$5,$6,'open')",
+        ticket_id, user["user_id"], user["top_one_id"], body.subject, body.message, body.category,
+    )
+    return {"id": ticket_id, "status": "open"}
 
 
 # ============================================================================
@@ -979,7 +1128,7 @@ async def admin_login(body: AdminLoginIn, request: Request):
     ip = request.client.host if request.client else "unknown"
     _check_login_rate_limit(ip)
     email = str(body.email).strip().lower()
-    admin = await db.admins.find_one({"email": email})
+    admin = await fetchrow("SELECT * FROM admins WHERE email = $1", email)
     # Constant-time-ish: always run one bcrypt check
     dummy = _hash_bcrypt("dummy-password") if not admin else None
     password_ok = _matches_bcrypt(body.password, admin["password_hash"]) if admin \
@@ -1002,12 +1151,12 @@ async def admin_me(admin=Depends(require_admin)):
 
 @admin_router.get("/stats")
 async def admin_stats():
-    users_count = await db.users.count_documents({})
-    pending_payments = await db.payments.count_documents({"status": "pending"})
-    verified_payments = await db.payments.count_documents({"status": "verified"})
-    active_subs = await db.subscriptions.count_documents({"status": "active"})
-    total_results = await db.results.count_documents({"status": "published"})
-    total_games = await db.games.count_documents({"status": {"$ne": "deleted"}})
+    users_count = (await fetchrow("SELECT count(*) AS c FROM users"))["c"]
+    pending_payments = (await fetchrow("SELECT count(*) AS c FROM payments WHERE status = 'pending'"))["c"]
+    verified_payments = (await fetchrow("SELECT count(*) AS c FROM payments WHERE status = 'verified'"))["c"]
+    active_subs = (await fetchrow("SELECT count(*) AS c FROM subscriptions WHERE status = 'active'"))["c"]
+    total_results = (await fetchrow("SELECT count(*) AS c FROM results WHERE status = 'published'"))["c"]
+    total_games = (await fetchrow("SELECT count(*) AS c FROM games WHERE status != 'deleted'"))["c"]
     return {
         "users": users_count,
         "pending_payments": pending_payments,
@@ -1021,14 +1170,17 @@ async def admin_stats():
 # ---- Users
 @admin_router.get("/users")
 async def admin_list_users(q: Optional[str] = None, limit: int = 50):
-    filter_q: dict[str, Any] = {}
+    limit = max(1, min(limit, 200))
     if q:
-        filter_q = {"$or": [
-            {"top_one_id": {"$regex": q, "$options": "i"}},
-            {"display_name": {"$regex": q, "$options": "i"}},
-        ]}
-    cursor = db.users.find(filter_q, {"_id": 0}).sort("created_at", -1).limit(max(1, min(limit, 200)))
-    users = [sanitize_user(u) async for u in cursor]
+        pattern = f"%{q}%"
+        rows = await fetchall(
+            "SELECT * FROM users WHERE top_one_id ILIKE $1 OR display_name ILIKE $1 "
+            "ORDER BY created_at DESC LIMIT $2",
+            pattern, limit,
+        )
+    else:
+        rows = await fetchall("SELECT * FROM users ORDER BY created_at DESC LIMIT $1", limit)
+    users = [sanitize_user(u) for u in rows]
     # Attach sub summary
     for u in users:
         sub = await _get_active_sub(u["user_id"])
@@ -1038,19 +1190,21 @@ async def admin_list_users(q: Optional[str] = None, limit: int = 50):
 
 @admin_router.get("/users/{user_id}")
 async def admin_get_user(user_id: str):
-    u = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    u = await fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
     if not u:
         raise HTTPException(404, "Not found")
-    payments = [sanitize_payment(p) async for p in db.payments.find({"user_id": user_id}, {"_id": 0}).sort("submitted_at", -1)]
-    subs = [sanitize_subscription(s) async for s in db.subscriptions.find({"user_id": user_id}, {"_id": 0}).sort("activated_at", -1)]
+    payments = [sanitize_payment(p) for p in await fetchall(
+        "SELECT * FROM payments WHERE user_id = $1 ORDER BY submitted_at DESC", user_id)]
+    subs = [sanitize_subscription(s) for s in await fetchall(
+        "SELECT * FROM subscriptions WHERE user_id = $1 ORDER BY activated_at DESC", user_id)]
     return {"user": sanitize_user(u), "payments": payments, "subscriptions": subs}
 
 
 # ---- Games
 @admin_router.get("/games")
 async def admin_games():
-    cursor = db.games.find({"status": {"$ne": "deleted"}}, {"_id": 0}).sort("sort_order", 1)
-    return [sanitize_game(g) async for g in cursor]
+    rows = await fetchall("SELECT * FROM games WHERE status != 'deleted' ORDER BY sort_order ASC")
+    return [sanitize_game(g) for g in rows]
 
 
 @admin_router.patch("/games/{game_id}")
@@ -1058,29 +1212,33 @@ async def admin_update_game(game_id: str, body: UpdateGameIn, admin=Depends(requ
     update = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if not update:
         raise HTTPException(400, "No fields")
-    res = await db.games.update_one({"id": game_id}, {"$set": update})
-    if res.matched_count == 0:
+    g = await _update_row("games", "id", game_id, update)
+    if not g:
         raise HTTPException(404, "Game not found")
     await _audit(f"admin:{admin['admin_id']}", "game.update", target=game_id, metadata=update)
-    g = await db.games.find_one({"id": game_id}, {"_id": 0})
     return sanitize_game(g)
 
 
 @admin_router.post("/games")
 async def admin_create_game(body: CreateGameIn, admin=Depends(require_admin)):
-    if await db.games.find_one({"id": body.id}):
+    if await fetchrow("SELECT 1 FROM games WHERE id = $1", body.id):
         raise HTTPException(409, "A game with this id already exists")
-    game = {**body.model_dump(), "created_at": _now(), "created_by": admin["admin_id"]}
-    await db.games.insert_one(dict(game))
+    await execute(
+        "INSERT INTO games (id, name, description, open_time, close_time, schedule_note, "
+        "status, sort_order, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        body.id, body.name, body.description, body.open_time, body.close_time,
+        body.schedule_note, body.status, body.sort_order, admin["admin_id"],
+    )
     await _audit(f"admin:{admin['admin_id']}", "game.create", target=body.id,
                  metadata={"name": body.name})
-    return sanitize_game(game)
+    g = await fetchrow("SELECT * FROM games WHERE id = $1", body.id)
+    return sanitize_game(g)
 
 
 @admin_router.delete("/games/{game_id}")
 async def admin_delete_game(game_id: str, admin=Depends(require_admin)):
-    res = await db.games.update_one({"id": game_id}, {"$set": {"status": "deleted"}})
-    if res.matched_count == 0:
+    g = await _update_row("games", "id", game_id, {"status": "deleted"})
+    if not g:
         raise HTTPException(404, "Game not found")
     await _audit(f"admin:{admin['admin_id']}", "game.delete", target=game_id)
     return {"ok": True}
@@ -1089,8 +1247,8 @@ async def admin_delete_game(game_id: str, admin=Depends(require_admin)):
 # ---- Plans (admin editable)
 @admin_router.get("/plans")
 async def admin_list_plans():
-    cursor = db.plans.find({}, {"_id": 0}).sort("sort_order", 1)
-    return [sanitize_plan(p) async for p in cursor]
+    rows = await fetchall("SELECT * FROM plans ORDER BY sort_order ASC")
+    return [sanitize_plan(p) for p in rows]
 
 
 @admin_router.patch("/plans/{plan_id}")
@@ -1104,62 +1262,61 @@ async def admin_update_plan(plan_id: str, body: UpdatePlanIn, admin=Depends(requ
     if not data:
         raise HTTPException(400, "No fields")
     data["updated_at"] = _now()
-    await db.plans.update_one({"id": plan_id}, {"$set": data})
+    updated = await _update_row("plans", "id", plan_id, data)
     await _audit(f"admin:{admin['admin_id']}", "plan.update", target=plan_id, metadata=data)
-    updated = await db.plans.find_one({"id": plan_id}, {"_id": 0})
     return sanitize_plan(updated)
 
 
 # ---- Results
 @admin_router.get("/results")
 async def admin_results(game_id: Optional[str] = None, limit: int = 100):
-    q: dict[str, Any] = {"status": {"$ne": "deleted"}}
+    limit = max(1, min(limit, 200))
     if game_id:
-        q["game_id"] = game_id
-    cursor = db.results.find(q, {"_id": 0}).sort([("date", -1), ("created_at", -1)]).limit(max(1, min(limit, 200)))
-    return [sanitize_result(r) async for r in cursor]
+        rows = await fetchall(
+            "SELECT * FROM results WHERE status != 'deleted' AND game_id = $1 "
+            "ORDER BY date DESC, created_at DESC LIMIT $2",
+            game_id, limit,
+        )
+    else:
+        rows = await fetchall(
+            "SELECT * FROM results WHERE status != 'deleted' "
+            "ORDER BY date DESC, created_at DESC LIMIT $1",
+            limit,
+        )
+    return [sanitize_result(r) for r in rows]
 
 
 @admin_router.post("/results")
 async def admin_create_result(body: CreateResultIn, admin=Depends(require_admin)):
-    g = await db.games.find_one({"id": body.game_id})
+    g = await fetchrow("SELECT * FROM games WHERE id = $1", body.game_id)
     if not g:
         raise HTTPException(404, "Game not found")
-    r = {
-        "id": str(uuid.uuid4()),
-        "game_id": body.game_id,
-        "date": body.date,
-        "session": body.session,
-        "open_pana": body.open_pana,
-        "open_digit": body.open_digit,
-        "jodi": body.jodi,
-        "close_pana": body.close_pana,
-        "close_digit": body.close_digit,
-        "status": "published",
-        "published_at": _now(),
-        "created_at": _now(),
-        "created_by": admin["admin_id"],
-    }
-    await db.results.insert_one(dict(r))
-    await _audit(f"admin:{admin['admin_id']}", "result.publish", target=r["id"],
+    result_id = str(uuid.uuid4())
+    published_at = _now()
+    await execute(
+        "INSERT INTO results (id, game_id, date, session, open_pana, open_digit, jodi, "
+        "close_pana, close_digit, status, published_at, created_by) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'published',$10,$11)",
+        result_id, body.game_id, body.date, body.session, body.open_pana, body.open_digit,
+        body.jodi, body.close_pana, body.close_digit, published_at, admin["admin_id"],
+    )
+    await _audit(f"admin:{admin['admin_id']}", "result.publish", target=result_id,
                  metadata={"game_id": body.game_id, "date": body.date})
     # Broadcast notification
-    await db.notifications.insert_one({
-        "id": str(uuid.uuid4()),
-        "user_id": "*",
-        "type": "result_new",
-        "title": f"New {g['name']} result",
-        "message": f"A new result for {g['name']} on {body.date} has been published.",
-        "read": False,
-        "created_at": _now(),
-    })
+    await execute(
+        "INSERT INTO notifications (id, user_id, type, title, message, read) "
+        "VALUES ($1,'*','result_new',$2,$3,false)",
+        str(uuid.uuid4()), f"New {g['name']} result",
+        f"A new result for {g['name']} on {body.date} has been published.",
+    )
+    r = await fetchrow("SELECT * FROM results WHERE id = $1", result_id)
     return sanitize_result(r)
 
 
 @admin_router.delete("/results/{result_id}")
 async def admin_delete_result(result_id: str, admin=Depends(require_admin)):
-    res = await db.results.update_one({"id": result_id}, {"$set": {"status": "deleted"}})
-    if res.matched_count == 0:
+    r = await _update_row("results", "id", result_id, {"status": "deleted"})
+    if not r:
         raise HTTPException(404, "Not found")
     await _audit(f"admin:{admin['admin_id']}", "result.delete", target=result_id)
     return {"ok": True}
@@ -1168,16 +1325,21 @@ async def admin_delete_result(result_id: str, admin=Depends(require_admin)):
 # ---- Payments
 @admin_router.get("/payments")
 async def admin_payments(status_filter: Optional[str] = None, limit: int = 100):
-    q: dict[str, Any] = {}
+    limit = max(1, min(limit, 200))
     if status_filter:
-        q["status"] = status_filter
-    cursor = db.payments.find(q, {"_id": 0}).sort("submitted_at", -1).limit(max(1, min(limit, 200)))
-    return [sanitize_payment(p) async for p in cursor]
+        rows = await fetchall(
+            "SELECT * FROM payments WHERE status = $1 ORDER BY submitted_at DESC LIMIT $2",
+            status_filter, limit,
+        )
+    else:
+        rows = await fetchall(
+            "SELECT * FROM payments ORDER BY submitted_at DESC LIMIT $1", limit)
+    return [sanitize_payment(p) for p in rows]
 
 
 @admin_router.post("/payments/{payment_id}/verify")
 async def admin_verify_payment(payment_id: str, body: VerifyPaymentIn, admin=Depends(require_admin)):
-    p = await db.payments.find_one({"id": payment_id})
+    p = await fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
     if not p:
         raise HTTPException(404, "Payment not found")
     if p["status"] != "pending":
@@ -1186,14 +1348,10 @@ async def admin_verify_payment(payment_id: str, body: VerifyPaymentIn, admin=Dep
     if body.action == "verify":
         # Activate subscription
         sub = await _activate_subscription(p["user_id"], p["plan_id"], p["id"])
-        await db.payments.update_one(
-            {"id": payment_id},
-            {"$set": {
-                "status": "verified",
-                "verified_at": _now(),
-                "verified_by": admin["admin_id"],
-                "subscription_id": sub["id"],
-            }},
+        await execute(
+            "UPDATE payments SET status = 'verified', verified_at = $1, verified_by = $2, "
+            "subscription_id = $3 WHERE id = $4",
+            _now(), admin["admin_id"], sub["id"], payment_id,
         )
         await _notify_user(p["user_id"], "payment_verified",
                            "Payment verified",
@@ -1203,36 +1361,37 @@ async def admin_verify_payment(payment_id: str, body: VerifyPaymentIn, admin=Dep
                            f"Your {p['plan_name']} is active. Enjoy your benefits.")
         await _audit(f"admin:{admin['admin_id']}", "payment.verify", target=payment_id,
                      metadata={"user_id": p["user_id"], "plan_id": p["plan_id"]})
-        updated = await db.payments.find_one({"id": payment_id}, {"_id": 0})
+        updated = await fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
         return sanitize_payment(updated)
 
     # reject
-    await db.payments.update_one(
-        {"id": payment_id},
-        {"$set": {
-            "status": "rejected",
-            "reject_reason": body.reason or "Not verified",
-            "verified_at": _now(),
-            "verified_by": admin["admin_id"],
-        }},
+    await execute(
+        "UPDATE payments SET status = 'rejected', reject_reason = $1, verified_at = $2, "
+        "verified_by = $3 WHERE id = $4",
+        body.reason or "Not verified", _now(), admin["admin_id"], payment_id,
     )
     await _notify_user(p["user_id"], "payment_rejected",
                        "Payment rejected",
                        f"Your {p['plan_name']} payment could not be verified. Reason: {body.reason or 'not verified'}. Please resubmit.")
     await _audit(f"admin:{admin['admin_id']}", "payment.reject", target=payment_id,
                  metadata={"user_id": p["user_id"], "reason": body.reason})
-    updated = await db.payments.find_one({"id": payment_id}, {"_id": 0})
+    updated = await fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
     return sanitize_payment(updated)
 
 
 # ---- Subscriptions
 @admin_router.get("/subscriptions")
 async def admin_subscriptions(status_filter: Optional[str] = None, limit: int = 100):
-    q: dict[str, Any] = {}
+    limit = max(1, min(limit, 200))
     if status_filter:
-        q["status"] = status_filter
-    cursor = db.subscriptions.find(q, {"_id": 0}).sort("activated_at", -1).limit(max(1, min(limit, 200)))
-    return [sanitize_subscription(s) async for s in cursor]
+        rows = await fetchall(
+            "SELECT * FROM subscriptions WHERE status = $1 ORDER BY activated_at DESC LIMIT $2",
+            status_filter, limit,
+        )
+    else:
+        rows = await fetchall(
+            "SELECT * FROM subscriptions ORDER BY activated_at DESC LIMIT $1", limit)
+    return [sanitize_subscription(s) for s in rows]
 
 
 # ---- Notifications broadcast
@@ -1244,45 +1403,40 @@ async def admin_create_notification(body: CreateNotificationIn, admin=Depends(re
         target_id = body.user_id
     else:
         target_id = "*"
-    n = {
-        "id": str(uuid.uuid4()),
-        "user_id": target_id,
-        "type": body.type,
-        "title": body.title,
-        "message": body.message,
-        "read": False,
-        "created_at": _now(),
-    }
-    await db.notifications.insert_one(dict(n))
+    n_id = str(uuid.uuid4())
+    await execute(
+        "INSERT INTO notifications (id, user_id, type, title, message, read) "
+        "VALUES ($1,$2,$3,$4,$5,false)",
+        n_id, target_id, body.type, body.title, body.message,
+    )
     await _audit(f"admin:{admin['admin_id']}", "notification.send", target=target_id,
                  metadata={"title": body.title})
+    n = await fetchrow("SELECT * FROM notifications WHERE id = $1", n_id)
     return sanitize_notification(n)
 
 
 # ---- Announcements
 @admin_router.get("/announcements")
 async def admin_list_announcements():
-    cursor = db.announcements.find({}, {"_id": 0}).sort("created_at", -1)
-    return [sanitize_announcement(a) async for a in cursor]
+    rows = await fetchall("SELECT * FROM announcements ORDER BY created_at DESC")
+    return [sanitize_announcement(a) for a in rows]
 
 
 @admin_router.post("/announcements")
 async def admin_create_announcement(body: CreateAnnouncementIn, admin=Depends(require_admin)):
-    a = {
-        "id": str(uuid.uuid4()),
-        "title": body.title,
-        "message": body.message,
-        "active": body.active,
-        "created_at": _now(),
-    }
-    await db.announcements.insert_one(dict(a))
-    await _audit(f"admin:{admin['admin_id']}", "announcement.create", target=a["id"])
+    a_id = str(uuid.uuid4())
+    await execute(
+        "INSERT INTO announcements (id, title, message, active) VALUES ($1,$2,$3,$4)",
+        a_id, body.title, body.message, body.active,
+    )
+    await _audit(f"admin:{admin['admin_id']}", "announcement.create", target=a_id)
+    a = await fetchrow("SELECT * FROM announcements WHERE id = $1", a_id)
     return sanitize_announcement(a)
 
 
 @admin_router.delete("/announcements/{aid}")
 async def admin_delete_announcement(aid: str, admin=Depends(require_admin)):
-    await db.announcements.update_one({"id": aid}, {"$set": {"active": False}})
+    await execute("UPDATE announcements SET active = false WHERE id = $1", aid)
     await _audit(f"admin:{admin['admin_id']}", "announcement.deactivate", target=aid)
     return {"ok": True}
 
@@ -1290,78 +1444,74 @@ async def admin_delete_announcement(aid: str, admin=Depends(require_admin)):
 # ---- Tips (targeted to subscribers)
 @admin_router.get("/tips")
 async def admin_list_tips(audience: Optional[str] = None, limit: int = 100):
-    q: dict[str, Any] = {}
+    limit = max(1, min(limit, 300))
     if audience in ("base", "pro", "both"):
-        q["audience"] = audience
-    cursor = db.tips.find(q, {"_id": 0}).sort("created_at", -1).limit(max(1, min(limit, 300)))
-    return [sanitize_tip(t) async for t in cursor]
+        rows = await fetchall(
+            "SELECT * FROM tips WHERE audience = $1 ORDER BY created_at DESC LIMIT $2",
+            audience, limit,
+        )
+    else:
+        rows = await fetchall("SELECT * FROM tips ORDER BY created_at DESC LIMIT $1", limit)
+    return [sanitize_tip(t) for t in rows]
 
 
 @admin_router.post("/tips")
 async def admin_create_tip(body: CreateTipIn, admin=Depends(require_admin)):
     # Validate game exists
-    g = await db.games.find_one({"id": body.game_id})
+    g = await fetchrow("SELECT * FROM games WHERE id = $1", body.game_id)
     if not g:
         raise HTTPException(404, "Game not found")
     # Pane tips are Pro-only content: disallow sending pane to base-only audience.
     if body.tip_type == "pane" and body.audience == "base":
         raise HTTPException(400, "Pane tips are Pro-only content. Set audience to 'pro' or 'both'.")
 
-    tip = {
-        "id": str(uuid.uuid4()),
-        "game_id": body.game_id,
-        "tip_type": body.tip_type,
-        "value": body.value.strip(),
-        "session": body.session,
-        "note": body.note,
-        "audience": body.audience,
-        "for_date": body.for_date,
-        "created_at": _now(),
-        "created_by": admin["admin_id"],
-    }
-    await db.tips.insert_one(dict(tip))
+    tip_id = str(uuid.uuid4())
+    await execute(
+        "INSERT INTO tips (id, game_id, tip_type, value, session, note, audience, for_date, "
+        "created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        tip_id, body.game_id, body.tip_type, body.value.strip(), body.session, body.note,
+        body.audience, body.for_date, admin["admin_id"],
+    )
 
     # Fan out an in-app notification to every subscriber whose plan matches
     # this tip's audience.
-    plans_to_target: list[str] = []
-    if body.audience == "both":
-        plans_to_target = ["base", "pro"]
-    else:
-        plans_to_target = [body.audience]
-
-    active_subs = db.subscriptions.find(
-        {"status": "active", "plan_id": {"$in": plans_to_target}},
-        {"user_id": 1, "plan_name": 1, "_id": 0},
+    plans_to_target = ["base", "pro"] if body.audience == "both" else [body.audience]
+    active_subs = await fetchall(
+        "SELECT user_id, plan_name FROM subscriptions WHERE status = 'active' AND plan_id = ANY($1)",
+        plans_to_target,
     )
-    now = _now()
-    notif_batch = []
-    async for s in active_subs:
-        notif_batch.append({
-            "id": str(uuid.uuid4()),
-            "user_id": s["user_id"],
-            "type": "tip_new",
-            "title": f"New {g['name']} tip for {s.get('plan_name', 'your plan')}",
-            "message": f"A fresh {body.tip_type.upper()} tip is waiting in your Tips channel.",
-            "read": False,
-            "created_at": now,
-        })
-    if notif_batch:
-        await db.notifications.insert_many(notif_batch)
+    reach = 0
+    if active_subs:
+        now = _now()
+        rows_to_insert = [
+            (str(uuid.uuid4()), s["user_id"], "tip_new",
+             f"New {g['name']} tip for {s.get('plan_name', 'your plan')}",
+             f"A fresh {body.tip_type.upper()} tip is waiting in your Tips channel.", False, now)
+            for s in active_subs
+        ]
+        async with pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO notifications (id, user_id, type, title, message, read, created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                rows_to_insert,
+            )
+        reach = len(rows_to_insert)
 
     await _audit(
         f"admin:{admin['admin_id']}",
         "tip.publish",
-        target=tip["id"],
+        target=tip_id,
         metadata={"game_id": body.game_id, "type": body.tip_type, "audience": body.audience,
-                  "reach": len(notif_batch)},
+                  "reach": reach},
     )
+    tip = await fetchrow("SELECT * FROM tips WHERE id = $1", tip_id)
     return sanitize_tip(tip)
 
 
 @admin_router.delete("/tips/{tip_id}")
 async def admin_delete_tip(tip_id: str, admin=Depends(require_admin)):
-    res = await db.tips.delete_one({"id": tip_id})
-    if res.deleted_count == 0:
+    result = await execute("DELETE FROM tips WHERE id = $1", tip_id)
+    if result == "DELETE 0":
         raise HTTPException(404, "Tip not found")
     await _audit(f"admin:{admin['admin_id']}", "tip.delete", target=tip_id)
     return {"ok": True}
@@ -1370,7 +1520,7 @@ async def admin_delete_tip(tip_id: str, admin=Depends(require_admin)):
 # ---- Payment configuration
 @admin_router.get("/settings/payment")
 async def admin_get_payment():
-    cfg = await db.settings.find_one({"key": "payment_config"}, {"_id": 0})
+    cfg = await fetchrow("SELECT * FROM settings WHERE key = 'payment_config'")
     return cfg or {}
 
 
@@ -1380,25 +1530,27 @@ async def admin_update_payment(body: PaymentConfigIn, admin=Depends(require_admi
     if not update:
         raise HTTPException(400, "No fields")
     update["updated_at"] = _now()
-    await db.settings.update_one({"key": "payment_config"}, {"$set": update}, upsert=True)
+    cfg = await _update_row("settings", "key", "payment_config", update)
     await _audit(f"admin:{admin['admin_id']}", "settings.payment.update", metadata=update)
-    cfg = await db.settings.find_one({"key": "payment_config"}, {"_id": 0})
     return cfg
 
 
 # ---- Audit logs
 @admin_router.get("/audit-logs")
 async def admin_audit(limit: int = 100):
-    cursor = db.audit_logs.find({}, {"_id": 0}).sort("created_at", -1).limit(max(1, min(limit, 500)))
-    return [sanitize_audit(a) async for a in cursor]
+    limit = max(1, min(limit, 500))
+    rows = await fetchall(
+        "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT $1", limit)
+    return [sanitize_audit(a) for a in rows]
 
 
 # ---- Support tickets
 @admin_router.get("/support/tickets")
 async def admin_tickets():
-    cursor = db.support_tickets.find({}, {"_id": 0}).sort("created_at", -1).limit(200)
+    rows = await fetchall(
+        "SELECT * FROM support_tickets ORDER BY created_at DESC LIMIT 200")
     tickets = []
-    async for t in cursor:
+    for t in rows:
         tickets.append({
             "id": t["id"],
             "user_id": t["user_id"],
