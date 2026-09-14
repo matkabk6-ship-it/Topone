@@ -1,0 +1,14 @@
+# --- Supabase Postgres connection ---
+# Replace [YOUR-DB-PASSWORD] below with your project's DB password.
+DATABASE_URL=postgresql://postgres:Ammu@0715##@db.ywdcqwkjbhcxwzcfqkub.supabase.co:5432/postgres
+
+# --- Auth / admin ---
+JWT_SECRET=twP7go1VWzJ22tG1L2lSA9n19pYMnSzrCgYw8rsXRis4RSfIBSw0nNQqKJJ1-6oH
+JWT_ISSUER=topone-api
+ADMIN_EMAIL=bipinkumar202425@gmail.com
+ADMIN_PASSWORD=Ammu@0715
+ADMIN_PIN=071525
+
+# --- Payments (UPI) ---
+UPI_ID= 6309285031@axl
+UPI_PAYEE_NAME=TOP ONE
