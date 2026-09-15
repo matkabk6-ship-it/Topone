@@ -326,12 +326,12 @@ def _create_admin_token(admin_id: str, email: str) -> str:
 DEFAULT_PLANS: list[dict[str, Any]] = [
     {
         "id": "base", "name": "Base Plan", "price": 299, "currency": "INR",
-        "benefits": {"open": 3, "jodi": 6, "pane": 0}, "duration_days": 30,
+        "benefits": {"open": 3, "jodi": 6, "pane": 0}, "duration_days": 07,
         "tagline": "3 Open, 6 Jodi", "active": True, "sort_order": 1,
     },
     {
         "id": "pro", "name": "Pro Plan", "price": 599, "currency": "INR",
-        "benefits": {"open": 1, "jodi": 2, "pane": 2}, "duration_days": 30,
+        "benefits": {"open": 1, "jodi": 2, "pane": 2}, "duration_days": 07,
         "tagline": "1 Open, 2 Jodi, 2 Pane", "active": True, "sort_order": 2,
     },
 ]
